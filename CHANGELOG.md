@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.6
+
+- **白名单真正生效**：模型散文里点名的工具必须在 `tool_names` 里，否则一律不补（此前可以点名任意已注册工具）
+- 不再回退调用 `tool.get_definitions`（该能力拿不到内置 `reply`），工具定义只取自每轮 `before_request` 的 `tool_definitions`；拿不到就什么都不做
+- `logical_turn_id` 取不到时直接放弃（宿主 `FunctionCallItem` 要求非空，之前写 null 会被丢弃并刷 warning）
+- 回写时保留 `ReasoningItem` / provider 活动项，只替换 assistant 正文，避免把推理从历史里删掉
+- 必填校验更严：`required` 缺失或写成字符串时也按安全策略处理；`reply_reference` 缺失直接放弃
+- 静默判断改为内置规则（不可配置）+ 可选补充词，补齐中文/英文常见说法
+- `msg_id` 只认 `msg_id=123` / `msg_id: 123` 形式，避免把引用里的数字当目标消息
+- 嵌套缩进改为按原始缩进长度比较，修掉 tab 与空格混用时丢嵌套的问题
+- hook 超时改为继承宿主默认值（原来 3s 内含嵌套 RPC，超时会触发熔断）
+- `models` 默认改为空（不限制），并在未命中时打日志，避免「装了但没反应」查不到原因
+- 日志提升：每轮工具列表、白名单拒绝、静默命中、缺参等都有明确记录
+- 去掉 `i18n.locales_path`（仓库内并无语言资源）
+
 ## 0.1.5
 
 - 修正工具定义解析：`tool.get_definitions` 的真实返回是 `{"success": true, "tools": [{"name", "definition": {"parameters_schema"}}]}`，旧代码按 OpenAI 风格找 `function.parameters` 找不到，导致兜底链路一直空转
