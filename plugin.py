@@ -73,7 +73,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="宿主侧插件开关（该字段由宿主维护）")
-    config_version: str = Field(default="0.1.7", description="配置版本")
+    config_version: str = Field(default="0.1.8", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -414,7 +414,7 @@ class PlannerReplyFixer(MaiBotPlugin):
                             if isinstance(it, dict) and it.get("item_type") == "UserMessageItem":
                                 self.ctx.logger.info(
                                     "[planner-fixer][diag] 最后一条用户消息=%r",
-                                    str(it)[:400],
+                                    _item_text(it)[:1200],
                                 )
                                 break
                     self._items_logged = True
@@ -557,8 +557,9 @@ class PlannerReplyFixer(MaiBotPlugin):
             hinted, spec_values = _parse_spec(text) if cfg.enabled_spec_parsing else ("", {})
             if not spec_values:
                 self.ctx.logger.info(
-                    "[planner-fixer] 没解析到参数结构，跳过。输出摘要：%s",
-                    text[:240].replace("\n", " "),
+                    "[planner-fixer] 没解析到参数结构，跳过。散文=%s 摘要：%s",
+                    "带回复意图" if _REPLY_INTENT.search(text) else "无回复意图",
+                    text[:200].replace("\n", " "),
                 )
                 return None
 
