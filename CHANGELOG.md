@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.15
+
+- README 的「装好了」示例日志改成与 `on_load()` 实际输出一致
+  （`已加载，工具白名单=['reply'] 散文模式=True dry_run=False`）
+- 散文模式不再悄悄回落到白名单里的另一个工具：
+  当 `prose_tool_name` 不在 `tool_names` 内时，记一条 warning 并跳过，
+  避免 `tool_names=["send_poke"]` 这种配置下被误用来戳人
+
+
 ## 0.1.14
 
 - 撤掉失效的 `fixer.models` 选项与 `config.get` 能力声明：

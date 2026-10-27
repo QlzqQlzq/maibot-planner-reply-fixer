@@ -4,7 +4,7 @@
 结果 bot 该回的话一句都不说。装上这个插件，遇到这种情况会自动把这次调用补上。
 
 - 插件 ID：`github.QlzqQlzq.planner-reply-fixer`
-- 版本：0.1.14
+- 版本：0.1.15
 - 许可：MIT
 
 ## 装上之后
@@ -23,7 +23,7 @@
 4. 日志里出现这行就说明装好了：
 
 ```
-[planner-fixer] 已加载，模型名单=不限制 工具白名单=['reply'] spec解析=True dry_run=False
+[planner-fixer] 已加载，工具白名单=['reply'] 散文模式=True dry_run=False
 ```
 
 ## 配置

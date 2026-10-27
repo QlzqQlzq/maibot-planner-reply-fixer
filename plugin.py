@@ -92,7 +92,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="宿主侧插件开关（该字段由宿主维护）")
-    config_version: str = Field(default="0.1.14", description="配置版本")
+    config_version: str = Field(default="0.1.15", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -560,10 +560,12 @@ class PlannerReplyFixer(MaiBotPlugin):
         if prose:
             want = str(getattr(self.config.fixer, "prose_tool_name", "reply") or "reply").strip().lower()
             if want not in allowed_lower:
-                if len(allowed) == 1:
-                    want = allowed[0].lower()
-                else:
-                    return None
+                self.ctx.logger.warning(
+                    "[planner-fixer] prose_tool_name=%s 不在白名单 %s 内，散文模式跳过（不会改用其它工具）",
+                    want,
+                    allowed,
+                )
+                return None
             return by_name.get(want)
 
         hint = (hinted or "").strip().lower()
