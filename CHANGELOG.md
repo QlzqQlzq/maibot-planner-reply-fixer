@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5
+
+- 修正工具定义解析：`tool.get_definitions` 的真实返回是 `{"success": true, "tools": [{"name", "definition": {"parameters_schema"}}]}`，旧代码按 OpenAI 风格找 `function.parameters` 找不到，导致兜底链路一直空转
+- 工具定义改为从 `maisaka.planner.before_request` 的 `tool_definitions` 缓存（每轮真实工具列表，含宿主内置 reply），`tool.get_definitions` 仅作回落
+- `logical_turn_id` 兜底值由 `""` 改为 `None`（宿主要求非空字符串或 null）
+- `_model_in_scope()` 读取宿主配置异常时改为不生效（fail-closed），避免「只对小模型生效」悄悄退化
+
 ## 0.1.4
 
 - 不再把 `config.toml` 提交进仓库（改由 Runner 按 config_model 生成），并加入 `.gitignore`，避免更新插件时冲突

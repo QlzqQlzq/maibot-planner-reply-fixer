@@ -58,7 +58,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用本插件")
-    config_version: str = Field(default="0.1.4", description="配置版本")
+    config_version: str = Field(default="0.1.5", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -147,18 +147,47 @@ def _has_tool_call(items: list[Any]) -> bool:
 
 
 def _normalize_definitions(raw: Any) -> list[dict[str, Any]]:
-    out = []
-    if not isinstance(raw, list):
-        return out
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        fn = item.get("function") if isinstance(item.get("function"), dict) else item
-        name = fn.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        params = fn.get("parameters")
-        out.append({"name": name, "parameters": params if isinstance(params, dict) else {}})
+    """把宿主给的几种工具定义形态统一成 [{name, parameters}]。
+
+    兼容：
+    1. hook 里的 tool_definitions（OpenAI 风格）：
+       {"type": "function", "function": {"name": ..., "parameters": {...}}}
+    2. 能力 tool.get_definitions 的返回：
+       {"success": true, "tools": [{"name": ..., "definition": {"name", "description", "parameters_schema"}}]}
+       （SDK 也可能只把 tools 解包成列表交给插件）
+    3. {"name": ..., "parameters": {...}} / {"name": ..., "parameters_schema": {...}}
+    """
+    out: list[dict[str, Any]] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("success") is not None and isinstance(node.get("tools"), list):
+                for sub in node["tools"]:
+                    _walk(sub)
+                return
+            if isinstance(node.get("tools"), list):
+                for sub in node["tools"]:
+                    _walk(sub)
+                return
+
+            fn = node.get("function") if isinstance(node.get("function"), dict) else None
+            definition = node.get("definition") if isinstance(node.get("definition"), dict) else None
+            source = fn or definition or node
+
+            name = source.get("name") or node.get("name")
+            params = source.get("parameters")
+            if not isinstance(params, dict):
+                params = source.get("parameters_schema")
+            if not isinstance(params, dict):
+                params = node.get("parameters_schema")
+            if isinstance(name, str) and name:
+                out.append({"name": name, "parameters": params if isinstance(params, dict) else {}})
+            return
+        if isinstance(node, list):
+            for sub in node:
+                _walk(sub)
+
+    _walk(raw)
     return out
 
 
@@ -345,6 +374,8 @@ class PlannerReplyFixer(MaiBotPlugin):
         super().__init__(*args, **kwargs)
         self._defs_cache: list[dict[str, Any]] = []
         self._defs_at = 0.0
+        # 每轮 before_request 里拿到的工具定义（session_id -> (定义, 时间)）
+        self._turn_defs: dict[str, tuple[list[dict[str, Any]], float]] = {}
 
     async def on_load(self) -> None:
         cfg = self.config.fixer
@@ -362,6 +393,7 @@ class PlannerReplyFixer(MaiBotPlugin):
     async def on_config_update(self, *args: Any, **kwargs: Any) -> None:
         self._defs_cache = []
         self._defs_at = 0.0
+        self._turn_defs.clear()
         self.ctx.logger.info("[planner-fixer] 配置已更新")
 
     async def _model_in_scope(self) -> bool:
@@ -371,10 +403,12 @@ class PlannerReplyFixer(MaiBotPlugin):
         try:
             planner_models = await self.ctx.config.get("model_task_config.planner.model_list", [])
         except Exception as exc:  # noqa: BLE001
-            self.ctx.logger.warning("[planner-fixer] 读取宿主模型配置失败，按生效处理: %r", exc)
-            return True
+            # 读不到就不生效，避免「只对小模型」悄悄退化成全局生效
+            self.ctx.logger.warning("[planner-fixer] 读取宿主模型配置失败，本轮不兜底: %r", exc)
+            return False
         if not isinstance(planner_models, list):
-            return True
+            self.ctx.logger.warning("[planner-fixer] planner 模型配置格式异常，本轮不兜底")
+            return False
         return bool({str(m).strip() for m in planner_models} & set(models))
 
     async def _tool_definitions(self) -> list[dict[str, Any]]:
@@ -390,12 +424,52 @@ class PlannerReplyFixer(MaiBotPlugin):
         self._defs_at = now
         return self._defs_cache
 
-    async def _pick_tool(self, hinted: str) -> dict[str, Any] | None:
+    def _defs_for_turn(self, session_id: str) -> list[dict[str, Any]]:
+        """取本轮 before_request 缓存的工具定义（含宿主内置工具）。"""
+        entry = self._turn_defs.get(session_id)
+        if not entry:
+            return []
+        defs, stamp = entry
+        if time.time() - stamp > 300:
+            self._turn_defs.pop(session_id, None)
+            return []
+        return defs
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="planner_tools_cache",
+        description="缓存本轮 planner 可用的工具定义，供 after_response 还原调用时使用",
+        mode=HookMode.OBSERVE,
+        order=HookOrder.NORMAL,
+        timeout_ms=2000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def remember_tool_definitions(self, **kwargs: Any) -> None:
+        try:
+            defs = _normalize_definitions(kwargs.get("tool_definitions"))
+            session_id = str(kwargs.get("session_id") or "")
+            if defs and session_id:
+                self._turn_defs[session_id] = (defs, time.time())
+                self.ctx.logger.debug(
+                    "[planner-fixer] 缓存本轮工具定义 %d 个: %s",
+                    len(defs),
+                    [d["name"] for d in defs][:12],
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.debug("[planner-fixer] 缓存工具定义失败: %r", exc)
+        return None
+
+    async def _pick_tool(self, hinted: str, session_id: str = "") -> dict[str, Any] | None:
         cfg = self.config.fixer
-        defs = await self._tool_definitions()
+        # 优先用本轮 before_request 的真实工具定义（内置工具也在里面）
+        defs = self._defs_for_turn(session_id)
+        if not defs:
+            defs = await self._tool_definitions()
         if not defs:
             return None
-        by_name = {d["name"]: d for d in defs}
+        by_name = {}
+        for d in defs:
+            by_name.setdefault(d["name"], d)
         for want in [hinted] + list(cfg.tool_names or []):
             name = str(want or "").strip()
             if name and name in by_name:
@@ -441,7 +515,7 @@ class PlannerReplyFixer(MaiBotPlugin):
                 self.ctx.logger.debug("[planner-fixer] 未发现工具调用说明，跳过")
                 return None
 
-            tool = await self._pick_tool(hinted_tool)
+            tool = await self._pick_tool(hinted_tool, str(kwargs.get("session_id") or ""))
             if not tool:
                 self.ctx.logger.info("[planner-fixer] 没有可用的已注册工具（hint=%s），放弃兜底", hinted_tool)
                 return None
@@ -469,7 +543,7 @@ class PlannerReplyFixer(MaiBotPlugin):
                 self.ctx.logger.info("[planner-fixer][dry-run] 命中 tool=%s args=%s", tool["name"], args)
                 return None
 
-            turn_id = ""
+            turn_id = None
             for item in items:
                 meta = item.get("meta") if isinstance(item, dict) else None
                 if isinstance(meta, dict) and meta.get("logical_turn_id"):
