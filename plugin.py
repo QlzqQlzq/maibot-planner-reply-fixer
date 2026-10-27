@@ -92,7 +92,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="宿主侧插件开关（该字段由宿主维护）")
-    config_version: str = Field(default="0.1.13", description="配置版本")
+    config_version: str = Field(default="0.1.14", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -103,10 +103,6 @@ class FixerConfig(PluginConfigBase):
     __ui_order__ = 1
 
     enabled: bool = Field(default=True, description="兜底开关")
-    models: list[str] = Field(
-        default_factory=list,
-        description="只对这些 planner 模型生效；留空表示不限制",
-    )
     tool_names: list[str] = Field(
         default_factory=lambda: ["reply"],
         description="允许兜底的工具白名单。模型散文里点到别的工具一律不认",
@@ -479,8 +475,7 @@ class PlannerReplyFixer(MaiBotPlugin):
         try:
             cfg = self.config.fixer
             self.ctx.logger.info(
-                "[planner-fixer] 已加载，模型名单=%s 工具白名单=%s 散文模式=%s dry_run=%s",
-                list(cfg.models or []) or "不限制",
+                "[planner-fixer] 已加载，工具白名单=%s 散文模式=%s dry_run=%s",
                 list(cfg.tool_names or []),
                 cfg.prose_mode,
                 cfg.dry_run,
@@ -546,39 +541,6 @@ class PlannerReplyFixer(MaiBotPlugin):
             return None
         return entry
 
-    # ---- 模型作用域 ----
-
-    async def _model_in_scope(self) -> bool:
-        try:
-            models = [str(m).strip() for m in (self.config.fixer.models or []) if str(m).strip()]
-        except Exception:
-            return False
-        if not models:
-            return True
-        try:
-            planner_models = await self.ctx.config.get("model_task_config.planner.model_list", [])
-        except Exception as exc:  # noqa: BLE001
-            self.ctx.logger.warning("[planner-fixer] 读取宿主模型配置失败，本轮不兜底: %r", exc)
-            return False
-        if not isinstance(planner_models, list):
-            self.ctx.logger.info("[planner-fixer] planner 模型配置格式异常，本轮不兜底")
-            return False
-        current = set()
-        for item in planner_models:
-            if isinstance(item, dict):
-                name = item.get("model") or item.get("name")
-                if name:
-                    current.add(str(name).strip())
-            else:
-                current.add(str(item).strip())
-        if current & set(models):
-            return True
-        self.ctx.logger.info(
-            "[planner-fixer] 当前 planner 模型不在名单内（名单=%s，实际=%s），本轮不兜底",
-            models,
-            sorted(current),
-        )
-        return False
 
     # ---- 选工具 ----
 
@@ -675,9 +637,6 @@ class PlannerReplyFixer(MaiBotPlugin):
                     self.ctx.logger.info("[planner-fixer] 命中静默关键词 %s，跳过", kw)
                     return None
 
-            if not await self._model_in_scope():
-                return None
-
             hinted, spec_values = _parse_spec(text)
             prose = False
             if not spec_values:
@@ -734,7 +693,9 @@ class PlannerReplyFixer(MaiBotPlugin):
                 return None
 
             if cfg.dry_run:
-                self.ctx.logger.info("[planner-fixer][dry-run] 命中 tool=%s args=%s", tool["name"], args)
+                self.ctx.logger.info(
+                    "[planner-fixer][dry-run] 命中 tool=%s 键=%s", tool["name"], ",".join(sorted(args.keys()))
+                )
                 return None
 
             call_item = {
@@ -757,7 +718,10 @@ class PlannerReplyFixer(MaiBotPlugin):
                 if isinstance(it, dict) and it.get("item_type") != "AssistantMessageItem"
             ]
             self.ctx.logger.info(
-                "[planner-fixer] 兜底还原为 %s(%s)（来源=%s）", tool["name"], args, "散文" if prose else "参数表"
+                "[planner-fixer] 兜底还原为 %s（键=%s，来源=%s）",
+                tool["name"],
+                ",".join(sorted(args.keys())),
+                "散文" if prose else "参数表",
             )
             return {"modified_kwargs": {**kwargs, "output_items": kept + [call_item]}}
         except Exception as exc:  # noqa: BLE001

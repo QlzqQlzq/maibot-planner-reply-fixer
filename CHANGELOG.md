@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.14
+
+- 撤掉失效的 `fixer.models` 选项与 `config.get` 能力声明：
+  `ctx.config.get("model_task_config.planner.model_list")` 读的是 bot_config，
+  而 planner 模型列表在 model_config 里，永远取到默认值 —— 一旦用户填了 `models`，
+  插件反而每轮都放弃。现在统一为「对所有 planner 模型生效」：
+  - 删除 `models` 配置项与 `_model_in_scope()`
+  - `capabilities` 置空（插件不再需要任何能力）
+  - README / manifest 描述同步
+- 日志不再打印完整 `args`：只记工具名与参数键名，避免把生成的参考文本写进日志
+
+
 ## 0.1.13
 
 - `reply_reference` 生成重写：

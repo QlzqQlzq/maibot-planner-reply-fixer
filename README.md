@@ -4,7 +4,7 @@
 结果 bot 该回的话一句都不说。装上这个插件，遇到这种情况会自动把这次调用补上。
 
 - 插件 ID：`github.QlzqQlzq.planner-reply-fixer`
-- 版本：0.1.13
+- 版本：0.1.14
 - 许可：MIT
 
 ## 装上之后
@@ -33,8 +33,8 @@
 | 键 | 默认值 | 说明 |
 |---|---|---|
 | `fixer.enabled` | `true` | 插件开关 |
-| `fixer.models` | `[]` | 只对这些 planner 模型生效；留空表示所有模型都管 |
 | `fixer.tool_names` | `["reply"]` | 白名单。只有这里的工具才会被补上，其它工具一律不碰 |
+| — | — | 插件对所有 planner 模型生效（不区分大小模型） |
 | `fixer.enabled_spec_parsing` | `true` | 是否解析「调用X工具：- key: value」这种说明；关掉插件就基本不工作了 |
 | `fixer.synth_reply_reference` | `true` | 缺 `reply_reference` 时，用 focus / reply_act / tone / scene 拼一句补上 |
 | `fixer.prose_mode` | `true` | 模型只写「可以简短接一句」这类散文时，插件自己从上下文取消息 id 补一次调用 |
@@ -42,13 +42,6 @@
 | `fixer.dry_run` | `false` | 设成 `true` 只记日志、不真的发，适合先看看效果 |
 | `fixer.min_text_chars` | `10` | 输出短于这个长度直接忽略 |
 | `fixer.silence_keywords` | `[]` | 额外静默词。内置静默判断（保持静默 / 不要调用 / stay silent 等）始终生效，这里只是补充 |
-
-只想让自己用的小模型生效，就这样写：
-
-```toml
-[fixer]
-models = ["spark-x2.6-4b"]
-```
 
 ## 什么情况下会动手
 
