@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+
+- 不再把 `config.toml` 提交进仓库（改由 Runner 按 config_model 生成），并加入 `.gitignore`，避免更新插件时冲突
+- `_manifest.json` 的 `capabilities` 补上 `config.get`（`_model_in_scope()` 会读取宿主的 planner 模型名单，之前未声明会被拒，导致「只对小模型生效」静默失效）
+- `config_version` 默认值与发布版本对齐
+
 ## 0.1.3
 
 - 修正 _manifest.json 的版本范围：host_application.max_version 改为 1.3.99，sdk.max_version 改为 2.9.99

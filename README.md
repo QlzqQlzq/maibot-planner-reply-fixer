@@ -4,7 +4,7 @@
 结果 bot 该回的话一句都不说。装上这个插件，遇到这种情况会自动把这次调用补上。
 
 - 插件 ID：`github.QlzqQlzq.planner-reply-fixer`
-- 版本：0.1.3
+- 版本：0.1.4
 - 许可：MIT
 
 ## 装上之后
@@ -17,7 +17,7 @@
 ## 安装
 
 1. 把整个文件夹放进 MaiBot 的 `plugins` 目录，文件夹名字随意，比如 `planner_reply_fixer`；
-2. 文件夹里要有 `_manifest.json`、`plugin.py`、`config.toml`；
+2. 文件夹里要有 `_manifest.json`、`plugin.py`；
 3. 重启 MaiBot，或者在 WebUI 的插件页重载一下；
 4. 日志里出现这行就说明装好了：
 
@@ -27,7 +27,9 @@
 
 ## 配置
 
-打开 `config.toml` 改，常用的就下面几个，其它一般不用动。
+第一次加载后，MaiBot 会按插件自带的配置结构自动生成 config.toml，改它就行（仓库里不带这个文件，免得更新时冲突）。
+
+常用的就下面几个，其它一般不用动。
 
 | 键 | 默认值 | 说明 |
 |---|---|---|

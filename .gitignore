@@ -7,3 +7,6 @@ logs/
 *.log
 .DS_Store
 Thumbs.db
+
+# Runner 会按 config_model 自动生成，不入库
+config.toml
