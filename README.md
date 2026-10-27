@@ -4,7 +4,7 @@
 结果 bot 该回的话一句都不说。装上这个插件，遇到这种情况会自动把这次调用补上。
 
 - 插件 ID：`github.QlzqQlzq.planner-reply-fixer`
-- 版本：0.1.15
+- 版本：0.1.16
 - 许可：MIT
 
 ## 装上之后
@@ -39,6 +39,7 @@
 | `fixer.synth_reply_reference` | `true` | 缺 `reply_reference` 时，用 focus / reply_act / tone / scene 拼一句补上 |
 | `fixer.prose_mode` | `true` | 模型只写「可以简短接一句」这类散文时，插件自己从上下文取消息 id 补一次调用 |
 | `fixer.prose_tool_name` | `reply` | 散文模式使用的工具（必须在 `tool_names` 里） |
+| `fixer.max_reference_chars` | `200` | 散文压成 reply_reference 的字数上限 |
 | `fixer.dry_run` | `false` | 设成 `true` 只记日志、不真的发，适合先看看效果 |
 | `fixer.min_text_chars` | `10` | 输出短于这个长度直接忽略 |
 | `fixer.silence_keywords` | `[]` | 额外静默词。内置静默判断（保持静默 / 不要调用 / stay silent 等）始终生效，这里只是补充 |

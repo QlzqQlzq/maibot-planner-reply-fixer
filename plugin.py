@@ -50,7 +50,7 @@ _SPEC_ITEM = re.compile(r"^(?P<indent>[ \t]*)[-*]\s*(?P<key>[A-Za-z_][A-Za-z0-9_
 _MSG_ID_STRICT = re.compile(r"msg_id\s*[=:：]\s*[\"']?(-?\d+)[\"']?", re.I)
 # 上下文里的 <message msg_id="..." quote="..." is_self_message="true">
 _CTX_TAG = re.compile(r"<message\s+([^>]*)>", re.I)
-_CTX_ATTR = re.compile(r'([A-Za-z_]+)\s*=\s*"([^"]*)"')
+_CTX_ATTR = re.compile(r"([A-Za-z_]+)\s*=\s*[\"\']([^\"\']*)[\"\']")
 
 # 明确表示「要走 reply 工具」
 _EXPLICIT_REPLY = re.compile(r"(?:通过|使用|用|调用)\s*reply|reply\s*工具", re.I)
@@ -92,7 +92,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="宿主侧插件开关（该字段由宿主维护）")
-    config_version: str = Field(default="0.1.15", description="配置版本")
+    config_version: str = Field(default="0.1.16", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -247,11 +247,40 @@ def _build_reference(text: str, limit: int) -> str:
 
 
 
-def _find_msg_id_in_context(items: list[Any]) -> str:
-    """从上一轮请求的上下文里取最新一条（非自己发的、非被引用的）消息 id。"""
-    latest = ""
-    for item in items:
+def _quote_ids(quote: str) -> set[str]:
+    """宿主 quote 可能是单个 id，也可能是逗号分隔的多个 id，还可能是转义过的标签。"""
+    if not quote:
+        return set()
+    text = quote.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    return set(re.findall(r"-?\d+", text))
+
+
+_CACHE_TEXT_MAX = 24
+_CACHE_TEXT_CHARS = 4000
+
+
+def _cache_texts(items: Any) -> list[str]:
+    """把 items 压成纯文本列表：图片/音频等 part 直接丢弃，避免 base64 占内存。"""
+    if not isinstance(items, list):
+        return []
+    out: list[str] = []
+    seen = set()
+    for item in items[-_CACHE_TEXT_MAX:]:
         text = _item_text(item)
+        if not text:
+            continue
+        text = text[:_CACHE_TEXT_CHARS]
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _find_msg_id_in_context(texts: list[str]) -> str:
+    """从上一轮请求的文本里取最新一条（非自己发的、非被引用的）消息 id。"""
+    latest = ""
+    for text in texts:
         if not text:
             continue
         clean = text.replace('\\"', '"').replace("\\\\", "")
@@ -262,10 +291,11 @@ def _find_msg_id_in_context(items: list[Any]) -> str:
                 continue
             if str(attrs.get("is_self_message") or "").lower() == "true":
                 continue
-            if attrs.get("quote") and attrs.get("quote") == msg_id:
+            if msg_id in _quote_ids(attrs.get("quote") or ""):
                 continue
             latest = msg_id
     return latest
+
 
 
 def _normalize_definitions(raw: Any) -> list[dict[str, Any]]:
@@ -509,15 +539,15 @@ class PlannerReplyFixer(MaiBotPlugin):
                 return None
             defs = _normalize_definitions(kwargs.get("tool_definitions"))
             items = kwargs.get("items")
-            ctx_items = items if isinstance(items, list) else []
+            texts = _cache_texts(items)
             now = time.time()
-            self._turns[session_id] = (defs, ctx_items, now)
+            self._turns[session_id] = (defs, texts, now)
             self._prune(now)
             self.ctx.logger.info(
-                "[planner-fixer] 本轮工具 %d 个：%s，上下文 %d 条",
+                "[planner-fixer] 本轮工具 %d 个：%s，上下文文本 %d 段",
                 len(defs),
                 [d["name"] for d in defs][:12],
-                len(ctx_items),
+                len(texts),
             )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("[planner-fixer] 缓存本轮信息失败: %r", exc)
@@ -603,7 +633,7 @@ class PlannerReplyFixer(MaiBotPlugin):
             if turn is None:
                 self.ctx.logger.debug("[planner-fixer] 本轮没有缓存（非 planner 轮次？），跳过")
                 return None
-            defs, ctx_items, _ = turn
+            defs, ctx_texts, _ = turn
             if not defs:
                 self.ctx.logger.debug("[planner-fixer] 本轮工具列表为空，跳过")
                 return None
@@ -645,7 +675,7 @@ class PlannerReplyFixer(MaiBotPlugin):
                 if not (cfg.prose_mode and _reply_intent(text)):
                     self.ctx.logger.debug("[planner-fixer] 没解析到参数结构且无回复意图，跳过")
                     return None
-                ctx_msg_id = _find_msg_id_in_context(ctx_items)
+                ctx_msg_id = _find_msg_id_in_context(ctx_texts)
                 if not ctx_msg_id:
                     self.ctx.logger.info("[planner-fixer] 散文带回复意图，但上下文里没有 msg_id，放弃")
                     return None
