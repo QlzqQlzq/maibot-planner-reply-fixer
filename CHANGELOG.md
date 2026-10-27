@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3
+
+- 修正 _manifest.json 的版本范围：host_application.max_version 改为 1.3.99，sdk.max_version 改为 2.9.99
+- 同步 config_version 与 README 版本号
+
 ## 0.1.2
 
 - **改为解析真实参数**：识别「调用reply工具：- msg_id: … / - expression_intent: …」这类文字说明，
