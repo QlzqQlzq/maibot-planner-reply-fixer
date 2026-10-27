@@ -1,0 +1,18 @@
+[plugin]
+enabled = true
+config_version = "0.1.1"
+
+[fixer]
+enabled = true
+models = ["spark-x2.6-4b"]      # 只对这些 planner 模型生效；留空 [] 表示不限制
+reply_tool_names = ["reply"]     # 必须是麦麦已注册的工具名
+text_arg_names = ["text", "content", "message", "msg", "reply", "reply_text"]
+dry_run = false                  # true = 只写日志不改写（观察用）
+allow_fallback = false           # 提取不到台词时不乱发兜底句
+fallback_text = "嗯。"
+max_reply_chars = 120
+min_text_chars = 20
+# 「决定调用回复工具」的强信号（必须明确说要调用）
+reply_keywords = ["调用reply", "调用 reply", "调用reply工具", "使用reply", "使用 reply", "reply工具", "reply 工具"]
+# 「决定静默」的否定信号（命中即放弃兜底）
+silence_keywords = ["不进行工具调用", "不调用", "保持静默", "保持沉默", "无需回复", "不需要回复", "不回复", "不发言", "不必回复", "wait"]

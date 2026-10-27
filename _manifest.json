@@ -1,0 +1,37 @@
+{
+  "manifest_version": 2,
+  "version": "0.1.1",
+  "name": "小模型决策兜底",
+  "description": "当 planner 只输出文字、没有发起工具调用时，把「想回复」的意图翻译成平台已注册回复工具的调用（只调真实存在的工具，不伪造；默认只对小模型生效）。",
+  "author": {
+    "name": "QlzqQlzq",
+    "url": "https://github.com/QlzqQlzq"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/QlzqQlzq/maibot-planner-reply-fixer",
+    "homepage": "https://github.com/QlzqQlzq/maibot-planner-reply-fixer",
+    "documentation": "https://github.com/QlzqQlzq/maibot-planner-reply-fixer/blob/main/README.md",
+    "issues": "https://github.com/QlzqQlzq/maibot-planner-reply-fixer/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "tool.get_definitions"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "github.QlzqQlzq.planner-reply-fixer"
+}
