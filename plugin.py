@@ -4,30 +4,33 @@
 
     决策：调用reply工具，让希罗发出一条温和的简短回应。
     调用reply工具：
-    - msg_id: 使用当前最新消息 msg_id="-123456"
+    - msg_id: "-123456"
     - expression_intent:
       - tone: 温和、柔和
       - focus: 对方的「摸摸头」请求
-      - reply_style: 正常回复
 
 它并没有真的发起 tool call，宿主于是判定「无调用」，角色什么都不说。
-本插件把这段文字按真实参数还原成一次工具调用；台词仍由宿主 replayer 生成。
+本插件把这段说明还原成一次真实工具调用；台词仍由宿主 replayer 生成。
+
+两种输入都能兜：
+1. 结构化：`调用X工具：\n- key: value`，按工具自己的 schema 过滤参数。
+2. 散文式：「可以简短接一句」「调用reply工具，语气轻松自然」——
+   从**上一轮请求里缓存下来的上下文**取出目标消息的 msg_id，把这段文字压成
+   reply_reference，拼成一次 reply 调用。
 
 安全约定（都是踩过的坑）：
-1. 工具名必须落在配置的 `tool_names` 白名单里。模型散文里点名的其它工具一律不认，
-   否则一句「调用 send_group_msg 工具」就能让它替你发消息。
-2. 工具定义只来自宿主每轮通过 `maisaka.planner.before_request` 交给我们的
-   `tool_definitions`（含内置 reply）。拿不到就当本轮不做，不猜、不回退。
-3. 参数只保留工具 schema 声明过的字段；`reply_reference` 这类必填缺失就放弃。
-4. `logical_turn_id` 必须非空（宿主 context_item 会校验），取不到就放弃。
-5. 回写时保留原来的 Reasoning / Provider Activity 项，只把 AssistantMessageItem 换成调用项，
-   避免把「为什么这么回」的推理从历史里抹掉。
-6. 模型明确表示不说话时直接跳过；任何异常都吞掉返回原样。
+1. 只在 `tool_names` 白名单里选工具；散文模式优先 reply，绝不盲取白名单第一项。
+2. 工具定义只来自 `maisaka.planner.before_request` 的 `tool_definitions`；拿不到就不做。
+3. 上下文只用于取 msg_id，且跳过自己发的消息与被引用的旧消息。
+4. 否定语义（不需要回复／不应该回应）优先于回复意图。
+5. `msg_id`、`reply_reference`、`logical_turn_id` 缺一个就放弃，不硬发。
+6. 回写时保留 Reasoning / Provider Activity，只替换 AssistantMessageItem。
 """
 
 import re
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
@@ -36,21 +39,28 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 HOOK_BEFORE = "maisaka.planner.before_request"
 HOOK_AFTER = "maisaka.planner.after_response"
-_TURN_DEFS_TTL = 300.0
-_TURN_DEFS_MAX = 128
+_TURN_TTL = 300.0
+_TURN_MAX = 64
 
 # 「调用 xxx 工具」的说明句
 _SPEC_HEAD = re.compile(r"调用\s*([A-Za-z_][A-Za-z0-9_]*)\s*工具|call\s+([A-Za-z_][A-Za-z0-9_]*)\s+tool", re.I)
 # 「- key: value」列表项（中英文冒号都认）
 _SPEC_ITEM = re.compile(r"^(?P<indent>[ \t]*)[-*]\s*(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*[:：]\s*(?P<val>.*)$")
-# msg_id：只认 `msg_id=123` / `msg_id: 123` 这种，避免把引用里的数字当目标
+# msg_id：只认 `msg_id=123` / `msg_id: 123`
 _MSG_ID_STRICT = re.compile(r"msg_id\s*[=:：]\s*[\"']?(-?\d+)[\"']?", re.I)
+# 上下文里的 <message msg_id="..." quote="..." is_self_message="true">
+_CTX_TAG = re.compile(r"<message\s+([^>]*)>", re.I)
+_CTX_ATTR = re.compile(r'([A-Za-z_]+)\s*=\s*"([^"]*)"')
 
-# 上下文里出现的消息 id：<message msg_id="-1510333019" quote=".." ...>
-_MSG_ID_FROM_CTX = re.compile(r'msg_id="(-?\d{3,})"')
-
-# 内置静默判断（不可配置，避免把安全阀关掉）
-# 明确表达「要发一条回复」的意图（用来抵消「无需调用工具」这类否定式）
+# 明确表示「要走 reply 工具」
+_EXPLICIT_REPLY = re.compile(r"(?:通过|使用|用|调用)\s*reply|reply\s*工具", re.I)
+# 否定式：不需要回复／不应该回应／不适合接一句
+_NEG_INTENT = re.compile(
+    r"(?:不|没|别|勿|无)\s*(?:需要|应该|适合|建议|宜|必|用|要)?\s*(?:再)?\s*"
+    r"(?:回复|回应|接一句|说一句|搭话|插一句)",
+    re.I,
+)
+# 回复意图（正向表述）
 _REPLY_INTENT = re.compile(
     r"(?:通过|使用|用|调用)\s*reply|reply\s*工具|"
     r"(?:可以|应该|需要|适合|自然|直接|建议|宜)\s*(?:简短|自然|轻松)?\s*(?:地)?\s*"
@@ -58,13 +68,16 @@ _REPLY_INTENT = re.compile(
     r"接一句|说一句|搭个话",
     re.I,
 )
-
+# 第三人称主体（只认多字词，避免「其他/其它」误伤口语里的「他/她」）
+_THIRD_PERSON = re.compile(r"(?:对方|他们|她们|别人|群友|群成员|其他人|其它人)")
+# 强静默：明确表示不参与
 _SILENCE_STRONG = re.compile(
     r"保持静默|保持沉默|保持安静|不说话|暂不发言|不要说话|不必说话|"
+    r"不用搭理|不必理会|无需参与|无需介入|"
     r"stay\s+silent|do\s*not\s+call\s+any\s+tool|don'?t\s+call\s+any\s+tool|no\s+tool\s+call",
     re.I,
 )
-# 弱的否定式：可以被「直接通过 reply 发出」这类表述抵消
+# 弱否定：可以被「明确要走 reply」抵消
 _SILENCE_WEAK = re.compile(
     r"不进行工具调用|不进行任何工具调用|不调用|无需调用|不要调用|不做任何操作|不回复",
     re.I,
@@ -79,7 +92,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="宿主侧插件开关（该字段由宿主维护）")
-    config_version: str = Field(default="0.1.10", description="配置版本")
+    config_version: str = Field(default="0.1.12", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -92,27 +105,31 @@ class FixerConfig(PluginConfigBase):
     enabled: bool = Field(default=True, description="兜底开关")
     models: list[str] = Field(
         default_factory=list,
-        description="只对这些 planner 模型生效；留空表示不限制（宿主 planner 随机选模型时建议留空）",
+        description="只对这些 planner 模型生效；留空表示不限制",
     )
     tool_names: list[str] = Field(
         default_factory=lambda: ["reply"],
         description="允许兜底的工具白名单。模型散文里点到别的工具一律不认",
     )
+    prose_mode: bool = Field(
+        default=True,
+        description="模型只写「可以简短接一句」这类散文时，用上下文里的 msg_id 硬拼一次调用",
+    )
+    prose_tool_name: str = Field(
+        default="reply",
+        description="散文模式使用的工具名（必须在 tool_names 白名单里）",
+    )
     enabled_spec_parsing: bool = Field(
         default=True,
-        description="是否解析「调用xxx工具：- key: value」这类文字说明",
+        description="是否解析「调用xxx工具：- key: value」这类说明；关掉则整个插件不工作",
     )
     synth_reply_reference: bool = Field(
         default=True,
-        description="缺少 reply_reference 时，用 focus / reply_act / tone / scene 拼一句上下文说明",
+        description="缺少 reply_reference 时，用 focus / reply_act / tone / scene 拼一句",
     )
-    prose_mode: bool = Field(
-        default=True,
-        description="模型只写「调用reply…」这类散文时，用上下文里的 msg_id 硬拼一次 reply 调用",
-    )
-    max_reference_chars: int = Field(default=160, ge=40, le=400, description="散文转 reply_reference 的字数上限")
     dry_run: bool = Field(default=False, description="只写日志、不改写输出（观察用）")
     min_text_chars: int = Field(default=10, ge=0, le=2000, description="模型输出短于该长度时忽略")
+    max_reference_chars: int = Field(default=160, ge=40, le=400, description="散文转 reply_reference 的字数上限")
     silence_keywords: list[str] = Field(
         default_factory=list,
         description="额外的静默关键词（内置静默判断始终生效，这里只做补充）",
@@ -126,7 +143,11 @@ class PlannerReplyFixerConfig(PluginConfigBase):
     fixer: FixerConfig = Field(default_factory=FixerConfig)
 
 
-# ---------------------------------------------------------------- 解析工具
+# ---------------------------------------------------------------- 文本工具
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
 
 
 def _item_text(item: Any) -> str:
@@ -156,14 +177,59 @@ def _has_tool_call(items: list[Any]) -> bool:
     return False
 
 
-def _normalize_definitions(raw: Any) -> list[dict[str, Any]]:
-    """把宿主给的几种工具定义形态统一成 [{name, parameters}]。
+def _reply_intent(text: str) -> bool:
+    """模型是不是在表达「我（角色）要说话」。
 
-    兼容：
-    1. hook 里 tool_definitions（OpenAI 风格）：{"type":"function","function":{"name","parameters"}}
-    2. 能力 tool.get_definitions 返回：{"success":true,"tools":[{"name","definition":{"parameters_schema"}}]}
-    3. {"name":...,"parameters":{...}} / {"name":...,"parameters_schema":{...}}
+    - 出现否定式（不需要回复/不适合接一句）且没有明确的「调用 reply」，视为不说话
+    - 只描述别人（对方/他们/其他人）该回，视为不说话
     """
+    if _NEG_INTENT.search(text) and not _EXPLICIT_REPLY.search(text):
+        return False
+    for mt in _REPLY_INTENT.finditer(text):
+        window = text[max(0, mt.start() - 10) : mt.start()]
+        if _THIRD_PERSON.search(window):
+            continue
+        return True
+    return False
+
+
+def _build_reference(text: str, limit: int) -> str:
+    """把模型那段散文压成 reply_reference（给 replayer 的方向说明）。"""
+    body = text
+    for marker in ("**决策：**", "**决策:**", "决策：", "决策:", "**分析：**", "分析：", "分析:", "决定：", "方案："):
+        if marker in body:
+            body = body.split(marker, 1)[1]
+            break
+    body = re.sub(r"msg_id\s*[=:：]\s*[\"']?-?\d+[\"']?", "", body)
+    body = re.sub(r"(?m)^\s*[-*]\s*[A-Za-z_]+\s*[:：].*$", "", body)
+    body = re.sub(r"调用\s*(?:reply|回复工具)", "", body)
+    body = _squash(body).lstrip("工具 -—:：。，,")
+    return body[:limit] or _squash(text)[:limit]
+
+
+def _find_msg_id_in_context(items: list[Any]) -> str:
+    """从上一轮请求的上下文里取最新一条（非自己发的、非被引用的）消息 id。"""
+    latest = ""
+    for item in items:
+        text = _item_text(item)
+        if not text:
+            continue
+        clean = text.replace('\\"', '"').replace("\\\\", "")
+        for tag in _CTX_TAG.findall(clean):
+            attrs = dict(_CTX_ATTR.findall(tag))
+            msg_id = str(attrs.get("msg_id") or "").strip()
+            if not msg_id:
+                continue
+            if str(attrs.get("is_self_message") or "").lower() == "true":
+                continue
+            if attrs.get("quote") and attrs.get("quote") == msg_id:
+                continue
+            latest = msg_id
+    return latest
+
+
+def _normalize_definitions(raw: Any) -> list[dict[str, Any]]:
+    """把几种工具定义形态统一成 [{name, parameters}]。"""
     out: list[dict[str, Any]] = []
     seen = set()
 
@@ -201,7 +267,7 @@ def _normalize_definitions(raw: Any) -> list[dict[str, Any]]:
 
 
 def _parse_spec(text: str) -> tuple[str, dict[str, Any]]:
-    """解析「- key: value」结构，返回 (文本里点名的工具, 参数字典)。"""
+    """解析「- key: value」结构，返回 (点名的工具, 参数字典)。"""
     tool = ""
     m = _SPEC_HEAD.search(text)
     if m:
@@ -241,7 +307,6 @@ def _parse_spec(text: str) -> tuple[str, dict[str, Any]]:
 
 
 def _coerce(value: Any, schema: dict[str, Any]) -> Any:
-    """按 schema 做最小类型转换；不合适返回 None（不猜、不补 0）。"""
     typ = schema.get("type")
     if isinstance(value, dict):
         return value if typ == "object" else None
@@ -257,8 +322,12 @@ def _coerce(value: Any, schema: dict[str, Any]) -> Any:
         except Exception:
             return None
     if typ == "array":
+        if isinstance(schema.get("items"), dict):
+            return None  # array-of-object 之类，交给上层放弃
         parts = [x.strip() for x in re.split(r"[,，、]", val) if x.strip()]
         return parts or None
+    if typ == "object":
+        return None
     if typ == "string":
         if schema.get("enum") and val not in schema["enum"]:
             for cand in schema["enum"]:
@@ -270,12 +339,10 @@ def _coerce(value: Any, schema: dict[str, Any]) -> Any:
 
 
 def _filter_by_schema(values: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
-    """只保留 schema 声明过的字段，并做类型/枚举收敛。"""
     props = schema.get("properties")
     if not isinstance(props, dict):
         return {}
 
-    # 模型常把 reply_style 之类写进 expression_intent 里，提到顶层
     intent = values.get("expression_intent")
     if isinstance(intent, dict):
         for sub_key in list(intent.keys()):
@@ -289,7 +356,7 @@ def _filter_by_schema(values: dict[str, Any], schema: dict[str, Any]) -> dict[st
             continue
         if key == "msg_id":
             text = str(raw)
-            normalized = text.strip().strip('"')
+            normalized = text.strip().strip('"\'')
             m = _MSG_ID_STRICT.search(text) or re.search(r"^(-?\d+)$", normalized)
             if m:
                 out["msg_id"] = m.group(1)
@@ -314,7 +381,6 @@ def _filter_by_schema(values: dict[str, Any], schema: dict[str, Any]) -> dict[st
 
 
 def _required_keys(schema: dict[str, Any]) -> list[str]:
-    """兼容 required 是 list / str。"""
     raw = schema.get("required")
     if isinstance(raw, str):
         return [raw]
@@ -326,7 +392,6 @@ def _required_keys(schema: dict[str, Any]) -> list[str]:
 def _fill_required(
     args: dict[str, Any], values: dict[str, Any], schema: dict[str, Any], synth_reference: bool
 ) -> dict[str, Any]:
-    """补齐必填项：msg_id 从文本抠，reply_reference 用解析到的上下文拼。"""
     props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
     for key in _required_keys(schema):
         if key in args:
@@ -354,37 +419,6 @@ def _fill_required(
     return args
 
 
-def _find_msg_id_in_items(items: list) -> str:
-    """从上下文 items 里取最新一条消息的 msg_id。
-
-    宿主渲染有两种形态：msg_id="-123" 与 msg_id=\"-123\"（引号被转义），都要认。
-    """
-    for item in reversed(items):
-        text = _item_text(item)
-        if not text:
-            continue
-        clean = text.replace('\\"', '"').replace("\\\\", "")
-        for found in re.findall(r'msg_id="?(-?\d{3,})', clean):
-            return found
-    return ""
-
-
-
-def _build_reference(text: str, limit: int) -> str:
-    """把模型那段散文压成 reply_reference（给 replayer 的方向说明）。"""
-    body = text
-    for marker in ("**决策：**", "**决策:**", "决策：", "决策:", "**分析：**", "分析：", "分析:"):
-        if marker in body:
-            body = body.split(marker, 1)[1]
-            break
-    body = re.sub(r"调用\s*(?:reply|回复工具)", "", body)
-    body = re.sub(r"^[\s，,。.:：、工具]+", "", body)
-    body = re.sub(r"\s+", " ", body).strip(" -—:：。")
-    if not body:
-        body = _squash(text)
-    return body[:limit]
-
-
 # ---------------------------------------------------------------- 插件本体
 
 
@@ -395,117 +429,78 @@ class PlannerReplyFixer(MaiBotPlugin):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._turn_defs: dict[str, tuple[list[dict[str, Any]], float]] = {}
+        self._turns: dict[str, tuple[list[dict[str, Any]], list[Any], float]] = {}
 
     async def on_load(self) -> None:
         try:
             cfg = self.config.fixer
             self.ctx.logger.info(
-                "[planner-fixer] 已加载，模型名单=%s 工具白名单=%s spec解析=%s dry_run=%s",
+                "[planner-fixer] 已加载，模型名单=%s 工具白名单=%s 散文模式=%s dry_run=%s",
                 list(cfg.models or []) or "不限制",
                 list(cfg.tool_names or []),
-                cfg.enabled_spec_parsing,
+                cfg.prose_mode,
                 cfg.dry_run,
             )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("[planner-fixer] 读取配置失败: %r", exc)
 
     async def on_unload(self) -> None:
-        self._turn_defs.clear()
+        self._turns.clear()
         return None
 
     async def on_config_update(self, *args: Any, **kwargs: Any) -> None:
-        self._turn_defs.clear()
+        self._turns.clear()
         self.ctx.logger.info("[planner-fixer] 配置已更新")
 
-    # ---- 工具定义：只认宿主每轮交过来的那份 ----
+    # ---- 本轮工具表 + 上下文：只在 before_request 拿得到 ----
 
     @HookHandler(
         HOOK_BEFORE,
-        name="planner_tools_cache",
-        description="缓存本轮 planner 可用的工具定义，供 after_response 还原调用时使用",
+        name="planner_turn_cache",
+        description="缓存本轮的可用工具与该轮上下文（after_response 只拿得到输出，拿不到上下文）",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
         timeout_ms=0,
         error_policy=ErrorPolicy.SKIP,
     )
-    async def remember_tool_definitions(self, **kwargs: Any) -> None:
+    async def remember_turn(self, **kwargs: Any) -> None:
         try:
             session_id = str(kwargs.get("session_id") or "")
             if not session_id:
                 return None
             defs = _normalize_definitions(kwargs.get("tool_definitions"))
+            items = kwargs.get("items")
+            ctx_items = items if isinstance(items, list) else []
             now = time.time()
-            self._turn_defs[session_id] = (defs, now)
+            self._turns[session_id] = (defs, ctx_items, now)
             self._prune(now)
             self.ctx.logger.info(
-                "[planner-fixer] 本轮工具 %d 个：%s", len(defs), [d["name"] for d in defs][:12]
+                "[planner-fixer] 本轮工具 %d 个：%s，上下文 %d 条",
+                len(defs),
+                [d["name"] for d in defs][:12],
+                len(ctx_items),
             )
-            if not getattr(self, "_items_logged", False):
-                try:
-                    self.ctx.logger.info("[planner-fixer][diag] session_id=%r", kwargs.get("session_id"))
-                    items = kwargs.get("items")
-                    if isinstance(items, list):
-                        for i2, it in enumerate(items[-6:]):
-                            if not isinstance(it, dict):
-                                continue
-                            body = _item_text(it)
-                            nums = re.findall(r"\d{6,}", body)
-                            self.ctx.logger.info(
-                                "[planner-fixer][diag] item[%d] %s nums=%s text=%r",
-                                i2,
-                                it.get("item_type"),
-                                nums[:5],
-                                body[:160].replace("\n", " "),
-                            )
-                    self._items_logged = True
-                except Exception as exc:  # noqa: BLE001
-                    self.ctx.logger.info("[planner-fixer][diag] 失败: %r", exc)
-            # 诊断：把所有 items 的正文与长数字都打出来（只打一次）
-            if not getattr(self, "_items_logged", False):
-                try:
-                    items = kwargs.get("items")
-                    if isinstance(items, list):
-                        for idx, it in enumerate(items[-8:]):
-                            if not isinstance(it, dict):
-                                continue
-                            body = _item_text(it)
-                            nums = re.findall(r"\d{6,}", body)
-                            self.ctx.logger.info(
-                                "[planner-fixer][diag] item[%d] type=%s nums=%s text=%r",
-                                idx,
-                                it.get("item_type"),
-                                nums[:6],
-                                body[:180].replace("\n", " "),
-                            )
-                    self._items_logged = True
-                except Exception as exc:  # noqa: BLE001
-                    self.ctx.logger.info("[planner-fixer][diag] 打印失败: %r", exc)
-                except Exception as exc:  # noqa: BLE001
-                    self.ctx.logger.info("[planner-fixer][diag] 打印失败: %r", exc)
         except Exception as exc:  # noqa: BLE001
-            self.ctx.logger.warning("[planner-fixer] 缓存工具定义失败: %r", exc)
+            self.ctx.logger.warning("[planner-fixer] 缓存本轮信息失败: %r", exc)
         return None
 
     def _prune(self, now: float) -> None:
-        for key in [k for k, (_, ts) in self._turn_defs.items() if now - ts > _TURN_DEFS_TTL]:
-            self._turn_defs.pop(key, None)
-        overflow = len(self._turn_defs) - _TURN_DEFS_MAX
+        for key in [k for k, v in self._turns.items() if now - v[2] > _TURN_TTL]:
+            self._turns.pop(key, None)
+        overflow = len(self._turns) - _TURN_MAX
         if overflow > 0:
-            oldest = sorted(self._turn_defs.items(), key=lambda kv: kv[1][1])[:overflow]
+            oldest = sorted(self._turns.items(), key=lambda kv: kv[1][2])[:overflow]
             for key, _ in oldest:
-                self._turn_defs.pop(key, None)
+                self._turns.pop(key, None)
 
-    def _defs_for_turn(self, session_id: str) -> list[dict[str, Any]] | None:
-        """返回本轮工具定义；没缓存过返回 None（表示本轮不该动）。"""
-        entry = self._turn_defs.get(session_id)
+    def _turn_for(self, session_id: str):
+        entry = self._turns.get(session_id)
         if not entry:
             return None
-        defs, stamp = entry
-        if time.time() - stamp > _TURN_DEFS_TTL:
-            self._turn_defs.pop(session_id, None)
+        if time.time() - entry[2] > _TURN_TTL:
+            self._turns.pop(session_id, None)
             return None
-        return defs
+        return entry
 
     # ---- 模型作用域 ----
 
@@ -541,27 +536,38 @@ class PlannerReplyFixer(MaiBotPlugin):
         )
         return False
 
-    # ---- 主链路 ----
+    # ---- 选工具 ----
 
-    def _pick_allowed_tool(self, hinted: str, defs: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """只允许白名单里的工具；点名的工具不在白名单就不做。"""
+    def _allowed(self) -> list[str]:
         try:
-            allowed = [str(x).strip() for x in (self.config.fixer.tool_names or []) if str(x).strip()]
+            return [str(x).strip() for x in (self.config.fixer.tool_names or []) if str(x).strip()]
         except Exception:
-            return None
+            return []
+
+    def _pick_tool(self, hinted: str, defs: list[dict[str, Any]], prose: bool) -> dict[str, Any] | None:
+        allowed = self._allowed()
         if not allowed:
             return None
-        allowed_lower = {a.lower() for a in allowed}
+        allowed_lower = {a.lower(): a for a in allowed}
         by_name = {d["name"].lower(): d for d in defs}
 
+        if prose:
+            want = str(getattr(self.config.fixer, "prose_tool_name", "reply") or "reply").strip().lower()
+            if want not in allowed_lower:
+                if len(allowed) == 1:
+                    want = allowed[0].lower()
+                else:
+                    return None
+            return by_name.get(want)
+
         hint = (hinted or "").strip().lower()
-        if hint:
-            if hint not in allowed_lower:
-                return None
-            return by_name.get(hint)
-        if len(allowed) == 1:
-            return by_name.get(allowed[0].lower())
-        return None
+        if not hint:
+            if len(allowed) == 1:
+                return by_name.get(allowed[0].lower())
+            return None
+        if hint not in allowed_lower:
+            return None
+        return by_name.get(hint)
 
     @HookHandler(
         HOOK_AFTER,
@@ -575,51 +581,50 @@ class PlannerReplyFixer(MaiBotPlugin):
     async def fix_planner_output(self, **kwargs: Any) -> dict[str, Any] | None:
         try:
             cfg = self.config.fixer
-            if not cfg.enabled:
+            if not cfg.enabled or not cfg.enabled_spec_parsing:
                 return None
 
-            items = kwargs.get("output_items")
-            if not isinstance(items, list) or not items:
+            output_items = kwargs.get("output_items")
+            if not isinstance(output_items, list) or not output_items:
                 return None
-            if _has_tool_call(items):
+            if _has_tool_call(output_items):
                 return None
 
             session_id = str(kwargs.get("session_id") or "")
-            defs = self._defs_for_turn(session_id)
-            if defs is None:
-                self.ctx.logger.debug("[planner-fixer] 本轮没有工具定义缓存（非 planner 轮次？），跳过")
+            turn = self._turn_for(session_id)
+            if turn is None:
+                self.ctx.logger.debug("[planner-fixer] 本轮没有缓存（非 planner 轮次？），跳过")
                 return None
+            defs, ctx_items, _ = turn
             if not defs:
                 self.ctx.logger.debug("[planner-fixer] 本轮工具列表为空，跳过")
                 return None
 
-            # 模型这一轮写的正文（只取 assistant 的 part，别混进上下文消息）
             text = "\n".join(
                 filter(
                     None,
                     (
                         _item_text(it)
-                        for it in items
+                        for it in output_items
                         if isinstance(it, dict) and it.get("item_type") == "AssistantMessageItem"
                     ),
                 )
             ).strip()
             if not text:
-                text = "\n".join(filter(None, (_item_text(it) for it in items))).strip()
+                self.ctx.logger.debug("[planner-fixer] 本轮没有 assistant 正文，跳过")
+                return None
             if len(text) < int(cfg.min_text_chars):
                 return None
 
-            wants_reply = bool(_REPLY_INTENT.search(text))
             if _SILENCE_STRONG.search(text):
                 self.ctx.logger.info("[planner-fixer] 命中强静默表述，跳过")
                 return None
-            if _SILENCE_WEAK.search(text) and not wants_reply:
+            if _NEG_INTENT.search(text) and not _EXPLICIT_REPLY.search(text):
+                self.ctx.logger.info("[planner-fixer] 命中否定语义（不需要回复），跳过")
+                return None
+            if _SILENCE_WEAK.search(text) and not _reply_intent(text):
                 self.ctx.logger.info("[planner-fixer] 命中弱否定且没有回复意图，跳过")
                 return None
-            if _SILENCE_WEAK.search(text) and wants_reply:
-                self.ctx.logger.info(
-                    "[planner-fixer] 文本有否定词但同时说要走 reply，按『要回复』处理：%s", text[:120]
-                )
             for kw in list(cfg.silence_keywords or []):
                 kw = str(kw).strip()
                 if kw and kw.lower() in text.lower():
@@ -629,60 +634,53 @@ class PlannerReplyFixer(MaiBotPlugin):
             if not await self._model_in_scope():
                 return None
 
-            hinted, spec_values = _parse_spec(text) if cfg.enabled_spec_parsing else ("", {})
-
-            prose_reply = False
+            hinted, spec_values = _parse_spec(text)
+            prose = False
             if not spec_values:
-                wants_reply = bool(_REPLY_INTENT.search(text))
-                if not (cfg.prose_mode and wants_reply):
-                    self.ctx.logger.info(
-                        "[planner-fixer] 没解析到参数结构，跳过。散文=%s 摘要：%s",
-                        "带回复意图" if wants_reply else "无回复意图",
-                        text[:200].replace("\n", " "),
-                    )
+                if not (cfg.prose_mode and _reply_intent(text)):
+                    self.ctx.logger.debug("[planner-fixer] 没解析到参数结构且无回复意图，跳过")
                     return None
-
-                ctx_msg_id = _find_msg_id_in_items(items)
+                ctx_msg_id = _find_msg_id_in_context(ctx_items)
                 if not ctx_msg_id:
                     self.ctx.logger.info("[planner-fixer] 散文带回复意图，但上下文里没有 msg_id，放弃")
                     return None
                 spec_values = {"msg_id": ctx_msg_id}
-                hinted = (self.config.fixer.tool_names or [""])[0]
-                prose_reply = True
+                prose = True
 
-            tool = self._pick_allowed_tool(hinted, defs)
+            tool = self._pick_tool(hinted, defs, prose)
             if not tool:
                 self.ctx.logger.info(
-                    "[planner-fixer] 点名的工具 %s 不在白名单 %s 内（或该轮没有这个工具），放弃",
+                    "[planner-fixer] 没有可用的白名单工具（点名=%s 白名单=%s），放弃",
                     hinted or "<无>",
-                    list(cfg.tool_names or []),
+                    self._allowed(),
                 )
                 return None
 
             schema = tool.get("parameters") or {}
-            args = _filter_by_schema(dict(spec_values), schema)
-            args = _fill_required(args, spec_values, schema, bool(cfg.synth_reply_reference))
-
-            if prose_reply and isinstance(schema.get("properties"), dict) and "reply_reference" in schema["properties"]:
-                if not args.get("reply_reference"):
-                    args["reply_reference"] = _build_reference(text, int(cfg.max_reference_chars))
+            source_values = dict(spec_values) if not prose else {"msg_id": spec_values["msg_id"]}
+            args = _filter_by_schema(deepcopy(source_values), schema)
+            if not prose:
+                args = _fill_required(args, deepcopy(spec_values), schema, bool(cfg.synth_reply_reference))
 
             props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
             if "reply_reference" in props and not args.get("reply_reference"):
-                self.ctx.logger.info("[planner-fixer] 缺 reply_reference，放弃兜底（tool=%s）", tool["name"])
-                return None
+                if prose:
+                    args["reply_reference"] = _build_reference(text, int(cfg.max_reference_chars))
+                elif cfg.synth_reply_reference:
+                    pass
+                if not args.get("reply_reference"):
+                    self.ctx.logger.info("[planner-fixer] 缺 reply_reference，放弃兜底（tool=%s）", tool["name"])
+                    return None
 
             missing = [k for k in _required_keys(schema) if k not in args]
             if missing:
                 self.ctx.logger.info("[planner-fixer] 缺必填参数 %s，放弃兜底（tool=%s）", missing, tool["name"])
                 return None
-
             if not args:
-                self.ctx.logger.info("[planner-fixer] 参数为空，放弃兜底")
                 return None
 
             turn_id = None
-            for item in items:
+            for item in output_items:
                 meta = item.get("meta") if isinstance(item, dict) else None
                 if isinstance(meta, dict) and meta.get("logical_turn_id"):
                     turn_id = str(meta["logical_turn_id"])
@@ -709,13 +707,14 @@ class PlannerReplyFixer(MaiBotPlugin):
                     "extra_content": {},
                 },
             }
-
             kept = [
                 it
-                for it in items
+                for it in output_items
                 if isinstance(it, dict) and it.get("item_type") != "AssistantMessageItem"
             ]
-            self.ctx.logger.info("[planner-fixer] 兜底还原为 %s(%s)", tool["name"], args)
+            self.ctx.logger.info(
+                "[planner-fixer] 兜底还原为 %s(%s)（来源=%s）", tool["name"], args, "散文" if prose else "参数表"
+            )
             return {"modified_kwargs": {**kwargs, "output_items": kept + [call_item]}}
         except Exception as exc:  # noqa: BLE001
             try:

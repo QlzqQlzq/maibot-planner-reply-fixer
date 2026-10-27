@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "0.1.10",
+  "version": "0.1.12",
   "name": "小模型决策兜底",
-  "description": "当 planner 只输出文字、没有发起工具调用时，把「想回复」的意图翻译成平台已注册回复工具的调用（只调真实存在的工具，不伪造；默认只对小模型生效）。",
+  "description": "当 planner 只输出文字、没有发起工具调用时，把「想回复」的意图翻译成回复工具的调用（只调 tool_names 白名单里真实存在的工具，不伪造工具、不写台词；默认对所有模型生效，可用 fixer.models 限定）。",
   "author": {
     "name": "QlzqQlzq",
     "url": "https://github.com/QlzqQlzq"
