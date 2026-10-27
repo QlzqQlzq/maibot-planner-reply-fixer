@@ -47,10 +47,20 @@ _SPEC_ITEM = re.compile(r"^(?P<indent>[ \t]*)[-*]\s*(?P<key>[A-Za-z_][A-Za-z0-9_
 _MSG_ID_STRICT = re.compile(r"msg_id\s*[=:：]\s*[\"']?(-?\d+)[\"']?", re.I)
 
 # 内置静默判断（不可配置，避免把安全阀关掉）
-_SILENCE_BUILTIN = re.compile(
-    r"不进行工具调用|不进行任何工具调用|不调用(?:任何)?(?:工具)?|无需调用|不要调用|"
-    r"保持静默|保持沉默|保持安静|不说话|暂不发言|不做任何操作|"
-    r"do\s*not\s+call(?:\s+any)?\s+tool|don'?t\s+call(?:\s+any)?\s+tool|stay\s+silent|no\s+tool\s+call",
+# 明确表达「要发一条回复」的意图（用来抵消「无需调用工具」这类否定式）
+_REPLY_INTENT = re.compile(
+    r"(?:通过|使用|用|调用)\s*reply|reply\s*工具(?:发出|回复|回应)?|直接(?:回复|回应|说话|发出)",
+    re.I,
+)
+
+_SILENCE_STRONG = re.compile(
+    r"保持静默|保持沉默|保持安静|不说话|暂不发言|不要说话|不必说话|"
+    r"stay\s+silent|do\s*not\s+call\s+any\s+tool|don'?t\s+call\s+any\s+tool|no\s+tool\s+call",
+    re.I,
+)
+# 弱的否定式：可以被「直接通过 reply 发出」这类表述抵消
+_SILENCE_WEAK = re.compile(
+    r"不进行工具调用|不进行任何工具调用|不调用|无需调用|不要调用|不做任何操作|不回复",
     re.I,
 )
 
@@ -63,7 +73,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="宿主侧插件开关（该字段由宿主维护）")
-    config_version: str = Field(default="0.1.6", description="配置版本")
+    config_version: str = Field(default="0.1.7", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -389,6 +399,27 @@ class PlannerReplyFixer(MaiBotPlugin):
             self.ctx.logger.info(
                 "[planner-fixer] 本轮工具 %d 个：%s", len(defs), [d["name"] for d in defs][:12]
             )
+            # 诊断：看 items 里有没有可用于 msg_id 的线索（只打一次）
+            if not getattr(self, "_items_logged", False):
+                try:
+                    items = kwargs.get("items")
+                    kinds = []
+                    if isinstance(items, list):
+                        for it in items[-6:]:
+                            if isinstance(it, dict):
+                                kinds.append(str(it.get("item_type")))
+                    self.ctx.logger.info("[planner-fixer][diag] items 尾部类型=%s", kinds)
+                    if isinstance(items, list):
+                        for it in reversed(items):
+                            if isinstance(it, dict) and it.get("item_type") == "UserMessageItem":
+                                self.ctx.logger.info(
+                                    "[planner-fixer][diag] 最后一条用户消息=%r",
+                                    str(it)[:400],
+                                )
+                                break
+                    self._items_logged = True
+                except Exception as exc:  # noqa: BLE001
+                    self.ctx.logger.info("[planner-fixer][diag] 打印失败: %r", exc)
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("[planner-fixer] 缓存工具定义失败: %r", exc)
         return None
@@ -503,9 +534,17 @@ class PlannerReplyFixer(MaiBotPlugin):
             if len(text) < int(cfg.min_text_chars):
                 return None
 
-            if _SILENCE_BUILTIN.search(text):
-                self.ctx.logger.info("[planner-fixer] 命中内置静默规则，跳过")
+            wants_reply = bool(_REPLY_INTENT.search(text))
+            if _SILENCE_STRONG.search(text):
+                self.ctx.logger.info("[planner-fixer] 命中强静默表述，跳过")
                 return None
+            if _SILENCE_WEAK.search(text) and not wants_reply:
+                self.ctx.logger.info("[planner-fixer] 命中弱否定且没有回复意图，跳过")
+                return None
+            if _SILENCE_WEAK.search(text) and wants_reply:
+                self.ctx.logger.info(
+                    "[planner-fixer] 文本有否定词但同时说要走 reply，按『要回复』处理：%s", text[:120]
+                )
             for kw in list(cfg.silence_keywords or []):
                 kw = str(kw).strip()
                 if kw and kw.lower() in text.lower():
@@ -517,7 +556,10 @@ class PlannerReplyFixer(MaiBotPlugin):
 
             hinted, spec_values = _parse_spec(text) if cfg.enabled_spec_parsing else ("", {})
             if not spec_values:
-                self.ctx.logger.debug("[planner-fixer] 没解析到参数结构，跳过")
+                self.ctx.logger.info(
+                    "[planner-fixer] 没解析到参数结构，跳过。输出摘要：%s",
+                    text[:240].replace("\n", " "),
+                )
                 return None
 
             tool = self._pick_allowed_tool(hinted, defs)
