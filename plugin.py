@@ -1,21 +1,30 @@
 """planner 决策兜底插件（小模型决策辅助）。
 
-背景：spark-x2.6-4b 这类小模型在 planner 阶段经常只写出
-「……因此决策为调用 reply，用简洁自然的口吻回应『xxx』」这样的文字，
-而不是真的发起 tool call，导致 Maisaka 判定「无调用」而不回复。
+背景：小参数量模型在 planner 阶段经常把「要调用的工具」写成一段文字说明，例如：
 
-做法：监听 `maisaka.planner.after_response`。当输出里没有任何工具调用、
-但文字明显表达了「想回复」的意图时，**从麦麦已注册的工具里**取出对应的
-回复工具（默认名字 reply），按它自己的参数 schema 填好文本，再改写成
-真实的工具调用。
+    决策：调用reply工具，让希罗发出一条温和的简短回应。
+    调用reply工具：
+    - msg_id: 使用当前最新消息 msg_id="-123456"
+    - expression_intent:
+      - tone: 温和、柔和
+      - scene: 关怀回应
+      - focus: A裘千仞的「摸摸希罗」请求
+      - reply_act: 确认关怀、柔和回应
+      - reply_style: 正常回复
 
-关键约束（重要）：
-- **不自己编工具**：工具名、参数名全部来自 `ctx.tool.get_definitions()`。
-  找不到匹配工具、或该工具的必需参数我们填不出来 → 直接放弃，保持原样。
-- 只在配置的模型名单命中时生效（读宿主 model_task_config.planner.model_list）。
-- 已经有工具调用时绝不插手。
-- dry_run 可先观察不改写。
-- 任何异常都吞掉并返回 None，保持宿主原有行为。
+它并没有真的发起 tool call，宿主于是判定「无调用」，角色什么都不说。
+
+本插件的做法（**解析真实参数**，不自己编台词）：
+1. 从这段文字里解析出「- key: value」结构（支持一层嵌套）；
+2. 用平台已注册工具的真实 parameters_schema 过滤字段、收敛类型、校验必填；
+3. 组装成真正的 FunctionCallItem —— 台词仍由宿主 replayer 生成。
+
+关键约束：
+- **不伪造工具**：工具名与参数名全部来自 `ctx.tool.get_definitions()`。
+- **不编台词**：只有该工具确实声明了文本参数时，才从引号里取台词；
+  否则一律不猜（例如麦麦的 reply 工具没有台词参数，台词由 replayer 生成）。
+- 尊重「不说话」：命中静默信号直接放弃。
+- 失败即放行：任何异常都吞掉返回 None。
 """
 
 import re
@@ -30,24 +39,26 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 HOOK_NAME = "maisaka.planner.after_response"
 _DEFS_TTL_SECONDS = 60.0
 
-# 引号里的台词候选：优先取它
+# 「调用 xxx 工具」的说明句
+_SPEC_HEAD = re.compile(r"调用\s*([A-Za-z_][A-Za-z0-9_]*)\s*工具|call\s+([A-Za-z_][A-Za-z0-9_]*)\s+tool", re.I)
+# 「- key: value」列表项（含中文冒号）
+_SPEC_ITEM = re.compile(r"^(?P<indent>\s*)[-*]\s*(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*[:：]\s*(?P<val>.*)$")
+# 从文字里捞 msg_id
+_MSG_ID = re.compile(r"msg_id\s*[=:：]\s*[\"']?(-?\d{4,})[\"']?", re.I)
+# 引号台词（仅当工具真声明文本参数时才用）
 _QUOTE_RE = re.compile(r"[「“\"']([^「」“”\"'（）()]{2,200})[」”\"']")
 _SENT_SPLIT = re.compile(r"[。！？!?\n]")
-# 判定「这句是不是分析/决策本身」，是就跳过
-_META_HINTS = ("决策", "分析", "理由", "调用", "工具", "判断", "因此", "综上")
-# 引号里如果只是角色名/工具名，也不要
-_NAME_LIKE = ("希罗", "二阶堂", "reply", "wait", "incomplete_talk", "工具", "决策")
 
 
 class PluginSectionConfig(PluginConfigBase):
-    """插件元信息段（宿主校验 config_version 用）。"""
+    """插件元信息段。"""
 
     __ui_label__ = "插件"
     __ui_icon__ = "package"
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用本插件")
-    config_version: str = Field(default="0.1.0", description="配置版本")
+    config_version: str = Field(default="0.1.2", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -62,34 +73,25 @@ class FixerConfig(PluginConfigBase):
         default_factory=lambda: ["spark-x2.6-4b"],
         description="只对这些 planner 模型生效；留空表示不限制",
     )
-    reply_tool_names: list[str] = Field(
+    tool_names: list[str] = Field(
         default_factory=lambda: ["reply"],
-        description="回复类工具的名字（必须是麦麦已注册的工具名，按顺序匹配）",
+        description="允许兜底的工具名（必须是已注册工具，按顺序匹配）",
+    )
+    enabled_spec_parsing: bool = Field(
+        default=True,
+        description="是否解析「调用xxx工具：- key: value」这类文字说明并还原成真实调用",
+    )
+    synth_reply_reference: bool = Field(
+        default=True,
+        description="缺少 reply_reference 时，用解析到的 focus/reply_act/tone 拼一句上下文说明补上",
     )
     text_arg_names: list[str] = Field(
         default_factory=lambda: ["text", "content", "message", "msg", "reply", "reply_text"],
-        description="回复工具里承载正文的参数名（按顺序匹配它的 schema）",
+        description="仅当工具真的声明了文本参数时，才用它承接从引号里提取的台词",
     )
     dry_run: bool = Field(default=False, description="只写日志、不改写输出（观察用）")
-    fallback_text: str = Field(default="嗯。", description="提取不到回复文本时的兜底句")
-    allow_fallback: bool = Field(
-        default=False,
-        description="提取不到台词时是否用 fallback_text 兜底发送（默认关闭，避免误发）",
-    )
-    max_reply_chars: int = Field(default=120, ge=10, le=500, description="兜底回复的最大字数")
     min_text_chars: int = Field(default=20, ge=0, le=2000, description="模型输出短于该长度时忽略")
-    reply_keywords: list[str] = Field(
-        default_factory=lambda: [
-            "调用reply",
-            "调用 reply",
-            "调用reply工具",
-            "使用reply",
-            "使用 reply",
-            "reply工具",
-            "reply 工具",
-        ],
-        description="判定『模型决定调用回复工具』的强信号（必须明确说要调用）",
-    )
+    max_reply_chars: int = Field(default=120, ge=10, le=500, description="提取台词时的最大字数")
     silence_keywords: list[str] = Field(
         default_factory=lambda: [
             "不进行工具调用",
@@ -114,22 +116,16 @@ class PlannerReplyFixerConfig(PluginConfigBase):
     fixer: FixerConfig = Field(default_factory=FixerConfig)
 
 
-def _trim(text: str, limit: int) -> str:
-    text = (text or "").strip().strip("\"'`")
-    text = re.sub(r"\s+", " ", text)
-    if len(text) > limit:
-        text = text[:limit].rstrip()
-    return text
+# ---------------------------------------------------------------- 工具函数
 
 
 def _item_text(item: Any) -> str:
-    """取出一个 Context Item 里的文本内容。"""
     if not isinstance(item, dict):
         return ""
     parts = item.get("parts")
     if not isinstance(parts, list):
         return ""
-    chunks: list[str] = []
+    chunks = []
     for part in parts:
         if isinstance(part, dict) and part.get("type") == "text":
             value = part.get("text")
@@ -150,26 +146,8 @@ def _has_tool_call(items: list[Any]) -> bool:
     return False
 
 
-def _extract_reply(text: str, limit: int, fallback: str) -> str:
-    """优先取引号里的台词；其次取最后一句非决策句。"""
-    spans = [s.strip() for s in _QUOTE_RE.findall(text) if s.strip()]
-    spans = [s for s in spans if not any(n in s for n in _NAME_LIKE)]
-    if spans:
-        return _trim(spans[-1], limit) or fallback
-
-    sentences = [s.strip() for s in _SENT_SPLIT.split(text) if s.strip()]
-    for sentence in reversed(sentences):
-        if any(k in sentence for k in _META_HINTS):
-            continue
-        cleaned = re.sub(r"^[因此所以综上，,：:\s]+", "", sentence)
-        if len(cleaned) >= 2:
-            return _trim(cleaned, limit)
-    return fallback
-
-
 def _normalize_definitions(raw: Any) -> list[dict[str, Any]]:
-    """把宿主返回的工具定义整理成 [{name, parameters}]。"""
-    out: list[dict[str, Any]] = []
+    out = []
     if not isinstance(raw, list):
         return out
     for item in raw:
@@ -184,39 +162,197 @@ def _normalize_definitions(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _parse_spec(text: str) -> tuple[str, dict[str, Any]]:
+    """解析「调用 X 工具：- key: value」结构，返回 (工具名, 参数字典)。"""
+    tool = ""
+    m = _SPEC_HEAD.search(text)
+    if m:
+        tool = (m.group(1) or m.group(2) or "").strip()
+
+    values: dict[str, Any] = {}
+    current_parent = None
+    parent_indent = -1
+
+    for line in text.splitlines():
+        item = _SPEC_ITEM.match(line)
+        if not item:
+            if current_parent is not None and line.strip() and not line.strip().startswith(("-", "*")):
+                target = values.get(current_parent)
+                if isinstance(target, str) and target:
+                    values[current_parent] = target + " " + line.strip()
+            continue
+
+        raw_indent = len(item.group("indent").replace("\t", "    "))
+        key = item.group("key")
+        val = item.group("val").strip()
+
+        if not val:
+            current_parent = key
+            parent_indent = raw_indent
+            values.setdefault(key, {})
+            continue
+
+        if current_parent is not None and raw_indent > parent_indent and isinstance(values.get(current_parent), dict):
+            values[current_parent][key] = val
+        else:
+            current_parent = None
+            parent_indent = -1
+            values[key] = val
+
+    mid = _MSG_ID.search(text)
+    if mid and not values.get("msg_id"):
+        values["msg_id"] = mid.group(1)
+
+    return tool, values
+
+
+def _coerce(value: Any, schema: dict[str, Any]) -> Any:
+    """按 schema 做最小限度的类型转换；不合适返回 None。"""
+    typ = schema.get("type")
+    if isinstance(value, dict):
+        return value if typ == "object" else None
+    if not isinstance(value, str):
+        return value
+    val = value.strip().strip("\"'")
+    if typ == "integer":
+        try:
+            return int(re.sub(r"[^\d-]", "", val) or 0)
+        except Exception:
+            return None
+    if typ == "array":
+        parts = [x.strip() for x in re.split(r"[,，、]", val) if x.strip()]
+        return parts or None
+    if typ == "string":
+        if schema.get("enum") and val not in schema["enum"]:
+            for cand in schema["enum"]:
+                if cand in val:
+                    return cand
+            return None
+        return val or None
+    return val or None
+
+
+def _filter_by_schema(values: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    """只保留 schema 里声明过的字段，并做类型/枚举收敛。"""
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return {}
+
+    # 模型常把 reply_style 之类写进 expression_intent 里，这里提升到顶层
+    intent = values.get("expression_intent")
+    if isinstance(intent, dict):
+        for sub_key in list(intent.keys()):
+            if sub_key in props and sub_key != "expression_intent" and sub_key not in values:
+                values[sub_key] = intent.pop(sub_key)
+
+    out: dict[str, Any] = {}
+    for key, raw in values.items():
+        spec = props.get(key)
+        if not isinstance(spec, dict):
+            continue
+        if key == "msg_id":
+            # msg_id 必须是纯 id：从「使用当前消息 msg_id="-123"」这类句子里抠出来
+            mid = _MSG_ID.search(str(raw)) or re.search(r"(-?\d{4,})", str(raw))
+            if mid:
+                out["msg_id"] = mid.group(1)
+            continue
+        if spec.get("type") == "object" and isinstance(raw, dict):
+            sub_props = spec.get("properties") or {}
+            sub_out = {}
+            for sub_key, sub_val in raw.items():
+                sub_spec = sub_props.get(sub_key)
+                if not isinstance(sub_spec, dict):
+                    continue
+                coerced = _coerce(sub_val, sub_spec)
+                if coerced not in (None, "", [], {}):
+                    sub_out[sub_key] = coerced
+            if sub_out:
+                out[key] = sub_out
+            continue
+        coerced = _coerce(raw, spec)
+        if coerced not in (None, "", [], {}):
+            out[key] = coerced
+    return out
+
+
+def _fill_required(
+    args: dict[str, Any], values: dict[str, Any], schema: dict[str, Any], synth_reference: bool
+) -> dict[str, Any]:
+    """补齐必填项（缺 reply_reference 时用解析到的上下文拼一句说明）。"""
+    required = schema.get("required")
+    if not isinstance(required, list):
+        return args
+    for key in required:
+        if key in args:
+            continue
+        if key == "msg_id":
+            mid = _MSG_ID.search(str(values.get("msg_id") or ""))
+            if mid:
+                args["msg_id"] = mid.group(1)
+            continue
+        if key == "reply_reference" and synth_reference:
+            pieces = []
+            intent = values.get("expression_intent") if isinstance(values.get("expression_intent"), dict) else {}
+            for label, src in (
+                ("focus", intent.get("focus")),
+                ("reply_act", intent.get("reply_act")),
+                ("tone", intent.get("tone")),
+                ("scene", intent.get("scene")),
+            ):
+                if src:
+                    pieces.append("%s: %s" % (label, src))
+            if values.get("reply_reference"):
+                pieces.insert(0, str(values["reply_reference"]))
+            if pieces:
+                args["reply_reference"] = "；".join(pieces)
+    return args
+
+
+def _extract_quote_line(text: str, limit: int) -> str:
+    spans = [s.strip() for s in _QUOTE_RE.findall(text) if s.strip()]
+    if spans:
+        return spans[-1][:limit]
+    for sentence in reversed([s.strip() for s in _SENT_SPLIT.split(text) if s.strip()]):
+        if any(k in sentence for k in ("决策", "分析", "调用", "工具", "因此")):
+            continue
+        cleaned = re.sub(r"^[因此所以综上，,：:\s]+", "", sentence)
+        if len(cleaned) >= 2:
+            return cleaned[:limit]
+    return ""
+
+
 def _pick_text_arg(tool: dict[str, Any], candidates: list[str]) -> str | None:
-    """在这个工具自己的 schema 里找承载正文的参数名。"""
-    params = tool.get("parameters") or {}
-    props = params.get("properties")
+    """只有工具真声明了文本参数时才返回参数名。"""
+    props = (tool.get("parameters") or {}).get("properties")
     if not isinstance(props, dict) or not props:
         return None
-    # 1) 按配置顺序匹配已存在的属性
     for cand in candidates:
-        if cand in props:
+        spec = props.get(cand)
+        if isinstance(spec, dict) and spec.get("type") == "string" and not spec.get("enum"):
             return cand
-    # 2) 退一步：找第一个 string 类型属性
-    for key, spec in props.items():
-        if isinstance(spec, dict) and str(spec.get("type") or "") == "string":
-            return key
     return None
 
 
+# ---------------------------------------------------------------- 插件本体
+
+
 class PlannerReplyFixer(MaiBotPlugin):
-    """planner 输出兜底：文字 -> 麦麦真实回复工具的调用。"""
+    """planner 输出兜底。"""
 
     config_model = PlannerReplyFixerConfig
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._defs_cache: list[dict[str, Any]] = []
-        self._defs_at: float = 0.0
+        self._defs_at = 0.0
 
     async def on_load(self) -> None:
         cfg = self.config.fixer
         self.ctx.logger.info(
-            "[planner-fixer] 已加载，模型名单=%s 工具名=%s dry_run=%s",
+            "[planner-fixer] 已加载，模型名单=%s 工具名=%s spec解析=%s dry_run=%s",
             list(getattr(cfg, "models", []) or []),
-            list(getattr(cfg, "reply_tool_names", []) or []),
+            list(getattr(cfg, "tool_names", []) or []),
+            getattr(cfg, "enabled_spec_parsing", True),
             getattr(cfg, "dry_run", False),
         )
 
@@ -224,7 +360,6 @@ class PlannerReplyFixer(MaiBotPlugin):
         return None
 
     async def on_config_update(self, *args: Any, **kwargs: Any) -> None:
-        """配置热更新：清掉工具定义缓存，下一轮重新拉取。"""
         self._defs_cache = []
         self._defs_at = 0.0
         self.ctx.logger.info("[planner-fixer] 配置已更新")
@@ -240,8 +375,7 @@ class PlannerReplyFixer(MaiBotPlugin):
             return True
         if not isinstance(planner_models, list):
             return True
-        current = {str(m).strip() for m in planner_models}
-        return bool(current & set(models))
+        return bool({str(m).strip() for m in planner_models} & set(models))
 
     async def _tool_definitions(self) -> list[dict[str, Any]]:
         now = time.time()
@@ -252,33 +386,26 @@ class PlannerReplyFixer(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("[planner-fixer] 获取工具定义失败: %r", exc)
             return []
-        defs = _normalize_definitions(raw)
-        self._defs_cache = defs
+        self._defs_cache = _normalize_definitions(raw)
         self._defs_at = now
-        return defs
+        return self._defs_cache
 
-    async def _resolve_reply_tool(self) -> tuple[str, str] | None:
-        """返回 (工具名, 正文参数名)，全部来自真实注册的工具定义。"""
+    async def _pick_tool(self, hinted: str) -> dict[str, Any] | None:
         cfg = self.config.fixer
         defs = await self._tool_definitions()
         if not defs:
             return None
         by_name = {d["name"]: d for d in defs}
-        for want in (cfg.reply_tool_names or []):
-            tool = by_name.get(str(want).strip())
-            if not tool:
-                continue
-            arg = _pick_text_arg(tool, list(cfg.text_arg_names or []))
-            if arg:
-                return tool["name"], arg
-            self.ctx.logger.info("[planner-fixer] 工具 %s 没有可填写的文本参数，跳过", tool["name"])
-            return None
+        for want in [hinted] + list(cfg.tool_names or []):
+            name = str(want or "").strip()
+            if name and name in by_name:
+                return by_name[name]
         return None
 
     @HookHandler(
         HOOK_NAME,
         name="planner_reply_fixer",
-        description="把 planner 的纯文字『想回复』意图改写为已注册回复工具的调用",
+        description="把 planner 的纯文字『要调用工具』说明还原成真实工具调用",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
         timeout_ms=3000,
@@ -301,42 +428,45 @@ class PlannerReplyFixer(MaiBotPlugin):
                 return None
 
             lowered = text.lower()
-
-            # 1) 先看否定信号：模型明确说静默/不调用 → 绝不动手
-            hit_silence = [str(k) for k in (cfg.silence_keywords or []) if str(k).lower() in lowered]
+            hit_silence = [k for k in (cfg.silence_keywords or []) if k.lower() in lowered]
             if hit_silence:
                 self.ctx.logger.debug("[planner-fixer] 命中静默信号 %s，跳过", hit_silence)
-                return None
-
-            # 2) 必须是明确的「调用 reply 工具」强信号
-            hit_reply = [str(k) for k in (cfg.reply_keywords or []) if str(k).lower() in lowered]
-            if not hit_reply:
                 return None
 
             if not await self._model_in_scope():
                 return None
 
-            resolved = await self._resolve_reply_tool()
-            if not resolved:
-                self.ctx.logger.info("[planner-fixer] 没有可用的已注册回复工具，放弃兜底")
+            hinted_tool, spec_values = _parse_spec(text) if cfg.enabled_spec_parsing else ("", {})
+            if not hinted_tool and not spec_values:
+                self.ctx.logger.debug("[planner-fixer] 未发现工具调用说明，跳过")
                 return None
-            tool_name, arg_name = resolved
 
-            # 3) 只认真正提取到的台词；没提取到默认不乱发
-            extracted = _extract_reply(text, int(cfg.max_reply_chars), "")
-            if not extracted:
-                if not cfg.allow_fallback:
-                    self.ctx.logger.info("[planner-fixer] 命中 %s 但没提取到台词，跳过（allow_fallback=false）", hit_reply)
+            tool = await self._pick_tool(hinted_tool)
+            if not tool:
+                self.ctx.logger.info("[planner-fixer] 没有可用的已注册工具（hint=%s），放弃兜底", hinted_tool)
+                return None
+
+            schema = tool.get("parameters") or {}
+            args = _filter_by_schema(spec_values, schema)
+            args = _fill_required(args, spec_values, schema, bool(cfg.synth_reply_reference))
+
+            if not args:
+                text_arg = _pick_text_arg(tool, list(cfg.text_arg_names or []))
+                line = _extract_quote_line(text, int(cfg.max_reply_chars)) if text_arg else ""
+                if line:
+                    args = {text_arg: line}
+                else:
+                    self.ctx.logger.info("[planner-fixer] 解析到的参数不足，放弃兜底（tool=%s）", tool["name"])
                     return None
-                extracted = cfg.fallback_text
-            reply_text = extracted
-            if not reply_text:
+
+            required = schema.get("required") if isinstance(schema.get("required"), list) else []
+            missing = [k for k in required if k not in args]
+            if missing:
+                self.ctx.logger.info("[planner-fixer] 缺少必填参数 %s，放弃兜底（tool=%s）", missing, tool["name"])
                 return None
 
             if cfg.dry_run:
-                self.ctx.logger.info(
-                    "[planner-fixer][dry-run] 命中，工具=%s 参数=%s 回复=%s", tool_name, arg_name, reply_text
-                )
+                self.ctx.logger.info("[planner-fixer][dry-run] 命中 tool=%s args=%s", tool["name"], args)
                 return None
 
             turn_id = ""
@@ -355,15 +485,12 @@ class PlannerReplyFixer(MaiBotPlugin):
                 },
                 "tool_call": {
                     "call_id": "call_" + uuid.uuid4().hex[:24],
-                    "func_name": tool_name,
-                    "args": {arg_name: reply_text},
+                    "func_name": tool["name"],
+                    "args": args,
                     "extra_content": {},
                 },
             }
-
-            self.ctx.logger.info(
-                "[planner-fixer] 兜底改写为 %s(%s=%s)", tool_name, arg_name, reply_text
-            )
+            self.ctx.logger.info("[planner-fixer] 兜底还原为 %s(%s)", tool["name"], args)
             return {"modified_kwargs": {**kwargs, "output_items": [call_item]}}
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("[planner-fixer] 兜底失败，保留原始输出: %r", exc)
@@ -371,5 +498,5 @@ class PlannerReplyFixer(MaiBotPlugin):
 
 
 def create_plugin() -> PlannerReplyFixer:
-    """宿主加载入口（MaiBot 要求插件模块导出该工厂函数）。"""
+    """宿主加载入口。"""
     return PlannerReplyFixer()
