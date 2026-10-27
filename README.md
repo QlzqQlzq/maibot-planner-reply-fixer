@@ -4,7 +4,7 @@
 结果 bot 该回的话一句都不说。装上这个插件，遇到这种情况会自动把这次调用补上。
 
 - 插件 ID：`github.QlzqQlzq.planner-reply-fixer`
-- 版本：0.1.8
+- 版本：0.1.10
 - 许可：MIT
 
 ## 装上之后

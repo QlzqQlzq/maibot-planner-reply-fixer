@@ -46,10 +46,16 @@ _SPEC_ITEM = re.compile(r"^(?P<indent>[ \t]*)[-*]\s*(?P<key>[A-Za-z_][A-Za-z0-9_
 # msg_id：只认 `msg_id=123` / `msg_id: 123` 这种，避免把引用里的数字当目标
 _MSG_ID_STRICT = re.compile(r"msg_id\s*[=:：]\s*[\"']?(-?\d+)[\"']?", re.I)
 
+# 上下文里出现的消息 id：<message msg_id="-1510333019" quote=".." ...>
+_MSG_ID_FROM_CTX = re.compile(r'msg_id="(-?\d{3,})"')
+
 # 内置静默判断（不可配置，避免把安全阀关掉）
 # 明确表达「要发一条回复」的意图（用来抵消「无需调用工具」这类否定式）
 _REPLY_INTENT = re.compile(
-    r"(?:通过|使用|用|调用)\s*reply|reply\s*工具(?:发出|回复|回应)?|直接(?:回复|回应|说话|发出)",
+    r"(?:通过|使用|用|调用)\s*reply|reply\s*工具|"
+    r"(?:可以|应该|需要|适合|自然|直接|建议|宜)\s*(?:简短|自然|轻松)?\s*(?:地)?\s*"
+    r"(?:回复|回应|接一句|说一句|搭话|插一句)|"
+    r"接一句|说一句|搭个话",
     re.I,
 )
 
@@ -73,7 +79,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="宿主侧插件开关（该字段由宿主维护）")
-    config_version: str = Field(default="0.1.8", description="配置版本")
+    config_version: str = Field(default="0.1.10", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -100,8 +106,13 @@ class FixerConfig(PluginConfigBase):
         default=True,
         description="缺少 reply_reference 时，用 focus / reply_act / tone / scene 拼一句上下文说明",
     )
+    prose_mode: bool = Field(
+        default=True,
+        description="模型只写「调用reply…」这类散文时，用上下文里的 msg_id 硬拼一次 reply 调用",
+    )
+    max_reference_chars: int = Field(default=160, ge=40, le=400, description="散文转 reply_reference 的字数上限")
     dry_run: bool = Field(default=False, description="只写日志、不改写输出（观察用）")
-    min_text_chars: int = Field(default=20, ge=0, le=2000, description="模型输出短于该长度时忽略")
+    min_text_chars: int = Field(default=10, ge=0, le=2000, description="模型输出短于该长度时忽略")
     silence_keywords: list[str] = Field(
         default_factory=list,
         description="额外的静默关键词（内置静默判断始终生效，这里只做补充）",
@@ -343,6 +354,37 @@ def _fill_required(
     return args
 
 
+def _find_msg_id_in_items(items: list) -> str:
+    """从上下文 items 里取最新一条消息的 msg_id。
+
+    宿主渲染有两种形态：msg_id="-123" 与 msg_id=\"-123\"（引号被转义），都要认。
+    """
+    for item in reversed(items):
+        text = _item_text(item)
+        if not text:
+            continue
+        clean = text.replace('\\"', '"').replace("\\\\", "")
+        for found in re.findall(r'msg_id="?(-?\d{3,})', clean):
+            return found
+    return ""
+
+
+
+def _build_reference(text: str, limit: int) -> str:
+    """把模型那段散文压成 reply_reference（给 replayer 的方向说明）。"""
+    body = text
+    for marker in ("**决策：**", "**决策:**", "决策：", "决策:", "**分析：**", "分析：", "分析:"):
+        if marker in body:
+            body = body.split(marker, 1)[1]
+            break
+    body = re.sub(r"调用\s*(?:reply|回复工具)", "", body)
+    body = re.sub(r"^[\s，,。.:：、工具]+", "", body)
+    body = re.sub(r"\s+", " ", body).strip(" -—:：。")
+    if not body:
+        body = _squash(text)
+    return body[:limit]
+
+
 # ---------------------------------------------------------------- 插件本体
 
 
@@ -399,25 +441,46 @@ class PlannerReplyFixer(MaiBotPlugin):
             self.ctx.logger.info(
                 "[planner-fixer] 本轮工具 %d 个：%s", len(defs), [d["name"] for d in defs][:12]
             )
-            # 诊断：看 items 里有没有可用于 msg_id 的线索（只打一次）
+            if not getattr(self, "_items_logged", False):
+                try:
+                    self.ctx.logger.info("[planner-fixer][diag] session_id=%r", kwargs.get("session_id"))
+                    items = kwargs.get("items")
+                    if isinstance(items, list):
+                        for i2, it in enumerate(items[-6:]):
+                            if not isinstance(it, dict):
+                                continue
+                            body = _item_text(it)
+                            nums = re.findall(r"\d{6,}", body)
+                            self.ctx.logger.info(
+                                "[planner-fixer][diag] item[%d] %s nums=%s text=%r",
+                                i2,
+                                it.get("item_type"),
+                                nums[:5],
+                                body[:160].replace("\n", " "),
+                            )
+                    self._items_logged = True
+                except Exception as exc:  # noqa: BLE001
+                    self.ctx.logger.info("[planner-fixer][diag] 失败: %r", exc)
+            # 诊断：把所有 items 的正文与长数字都打出来（只打一次）
             if not getattr(self, "_items_logged", False):
                 try:
                     items = kwargs.get("items")
-                    kinds = []
                     if isinstance(items, list):
-                        for it in items[-6:]:
-                            if isinstance(it, dict):
-                                kinds.append(str(it.get("item_type")))
-                    self.ctx.logger.info("[planner-fixer][diag] items 尾部类型=%s", kinds)
-                    if isinstance(items, list):
-                        for it in reversed(items):
-                            if isinstance(it, dict) and it.get("item_type") == "UserMessageItem":
-                                self.ctx.logger.info(
-                                    "[planner-fixer][diag] 最后一条用户消息=%r",
-                                    _item_text(it)[:1200],
-                                )
-                                break
+                        for idx, it in enumerate(items[-8:]):
+                            if not isinstance(it, dict):
+                                continue
+                            body = _item_text(it)
+                            nums = re.findall(r"\d{6,}", body)
+                            self.ctx.logger.info(
+                                "[planner-fixer][diag] item[%d] type=%s nums=%s text=%r",
+                                idx,
+                                it.get("item_type"),
+                                nums[:6],
+                                body[:180].replace("\n", " "),
+                            )
                     self._items_logged = True
+                except Exception as exc:  # noqa: BLE001
+                    self.ctx.logger.info("[planner-fixer][diag] 打印失败: %r", exc)
                 except Exception as exc:  # noqa: BLE001
                     self.ctx.logger.info("[planner-fixer][diag] 打印失败: %r", exc)
         except Exception as exc:  # noqa: BLE001
@@ -530,7 +593,19 @@ class PlannerReplyFixer(MaiBotPlugin):
                 self.ctx.logger.debug("[planner-fixer] 本轮工具列表为空，跳过")
                 return None
 
-            text = "\n".join(filter(None, (_item_text(it) for it in items))).strip()
+            # 模型这一轮写的正文（只取 assistant 的 part，别混进上下文消息）
+            text = "\n".join(
+                filter(
+                    None,
+                    (
+                        _item_text(it)
+                        for it in items
+                        if isinstance(it, dict) and it.get("item_type") == "AssistantMessageItem"
+                    ),
+                )
+            ).strip()
+            if not text:
+                text = "\n".join(filter(None, (_item_text(it) for it in items))).strip()
             if len(text) < int(cfg.min_text_chars):
                 return None
 
@@ -555,13 +630,25 @@ class PlannerReplyFixer(MaiBotPlugin):
                 return None
 
             hinted, spec_values = _parse_spec(text) if cfg.enabled_spec_parsing else ("", {})
+
+            prose_reply = False
             if not spec_values:
-                self.ctx.logger.info(
-                    "[planner-fixer] 没解析到参数结构，跳过。散文=%s 摘要：%s",
-                    "带回复意图" if _REPLY_INTENT.search(text) else "无回复意图",
-                    text[:200].replace("\n", " "),
-                )
-                return None
+                wants_reply = bool(_REPLY_INTENT.search(text))
+                if not (cfg.prose_mode and wants_reply):
+                    self.ctx.logger.info(
+                        "[planner-fixer] 没解析到参数结构，跳过。散文=%s 摘要：%s",
+                        "带回复意图" if wants_reply else "无回复意图",
+                        text[:200].replace("\n", " "),
+                    )
+                    return None
+
+                ctx_msg_id = _find_msg_id_in_items(items)
+                if not ctx_msg_id:
+                    self.ctx.logger.info("[planner-fixer] 散文带回复意图，但上下文里没有 msg_id，放弃")
+                    return None
+                spec_values = {"msg_id": ctx_msg_id}
+                hinted = (self.config.fixer.tool_names or [""])[0]
+                prose_reply = True
 
             tool = self._pick_allowed_tool(hinted, defs)
             if not tool:
@@ -575,6 +662,10 @@ class PlannerReplyFixer(MaiBotPlugin):
             schema = tool.get("parameters") or {}
             args = _filter_by_schema(dict(spec_values), schema)
             args = _fill_required(args, spec_values, schema, bool(cfg.synth_reply_reference))
+
+            if prose_reply and isinstance(schema.get("properties"), dict) and "reply_reference" in schema["properties"]:
+                if not args.get("reply_reference"):
+                    args["reply_reference"] = _build_reference(text, int(cfg.max_reference_chars))
 
             props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
             if "reply_reference" in props and not args.get("reply_reference"):
