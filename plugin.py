@@ -92,7 +92,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="宿主侧插件开关（该字段由宿主维护）")
-    config_version: str = Field(default="0.1.12", description="配置版本")
+    config_version: str = Field(default="0.1.13", description="配置版本")
 
 
 class FixerConfig(PluginConfigBase):
@@ -129,7 +129,7 @@ class FixerConfig(PluginConfigBase):
     )
     dry_run: bool = Field(default=False, description="只写日志、不改写输出（观察用）")
     min_text_chars: int = Field(default=10, ge=0, le=2000, description="模型输出短于该长度时忽略")
-    max_reference_chars: int = Field(default=160, ge=40, le=400, description="散文转 reply_reference 的字数上限")
+    max_reference_chars: int = Field(default=200, ge=40, le=400, description="散文转 reply_reference 的字数上限")
     silence_keywords: list[str] = Field(
         default_factory=list,
         description="额外的静默关键词（内置静默判断始终生效，这里只做补充）",
@@ -194,17 +194,61 @@ def _reply_intent(text: str) -> bool:
 
 
 def _build_reference(text: str, limit: int) -> str:
-    """把模型那段散文压成 reply_reference（给 replayer 的方向说明）。"""
+    """把模型那段散文压成 reply_reference（给 replayer 的方向说明）。
+
+    - 去掉尾部括注（「（本轮…）」这类）
+    - 丢掉含「无需调用/不必回复」的句子，避免和「要回复」自相矛盾
+    - 只在句末或逗号处截断，不留半句话
+    """
     body = text
     for marker in ("**决策：**", "**决策:**", "决策：", "决策:", "**分析：**", "分析：", "分析:", "决定：", "方案："):
         if marker in body:
             body = body.split(marker, 1)[1]
             break
+
     body = re.sub(r"msg_id\s*[=:：]\s*[\"']?-?\d+[\"']?", "", body)
     body = re.sub(r"(?m)^\s*[-*]\s*[A-Za-z_]+\s*[:：].*$", "", body)
-    body = re.sub(r"调用\s*(?:reply|回复工具)", "", body)
-    body = _squash(body).lstrip("工具 -—:：。，,")
-    return body[:limit] or _squash(text)[:limit]
+    body = re.sub(r"调用\s*(?:reply|回复工具)\s*工具?", "", body)
+    body = _squash(body)
+    body = re.sub(r"^工具[\s，,。:：]*", "", body)
+
+    # 去尾部括注（闭合的 + 被截断未闭合的）
+    for _ in range(2):
+        trimmed = re.sub(r"[（(][^（）()]*[）)]\s*[。；;]?\s*$", "", body).strip()
+        if trimmed == body:
+            break
+        body = trimmed
+    body = re.sub(r"[（(][^（）()]*$", "", body).strip()
+
+    # 按分句过滤：只丢掉「无需调用工具」这类否定分句，保留方向描述
+    neg = re.compile(r"(?:无需|不需要|不必|不用|不进行|不做|暂不)[^。！？；，,]{0,12}(?:工具|调用|回复|发言|回应)")
+    sentences = re.split(r"(?<=[。！？；;!?])", body)
+    kept_sentences = []
+    for sent in sentences:
+        if not sent.strip():
+            continue
+        clauses = re.split(r"(?<=[，,、])", sent)
+        kept_clauses = [c for c in clauses if not neg.search(c)]
+        merged = "".join(kept_clauses).strip()
+        if merged:
+            kept_sentences.append(merged)
+    body = "".join(kept_sentences).strip() or body
+
+    # 长度控制：先按句末，再退化到逗号
+    if len(body) > limit:
+        head = body[:limit]
+        cut = max(head.rfind("。"), head.rfind("！"), head.rfind("？"), head.rfind("；"), head.rfind(";"))
+        if cut >= max(20, limit // 2):
+            body = head[: cut + 1]
+        else:
+            cut2 = max(head.rfind("，"), head.rfind(","), head.rfind("、"))
+            body = head[:cut2] if cut2 >= max(12, limit // 3) else head
+
+    body = body.strip(" 　-—:：。，,")
+    if len(body) < 8:
+        body = _squash(text)[:limit]
+    return body
+
 
 
 def _find_msg_id_in_context(items: list[Any]) -> str:
